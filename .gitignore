@@ -1,0 +1,18 @@
+# Secrets and local environment files
+.env
+.env.*
+!.env.example
+
+# Generated delivery results and local runtime artifacts
+result.csv
+result.*.csv
+receiving_numbers.csv
+results/
+logs/
+mms_img/
+.superpowers/
+*.jsonl
+*.log
+__pycache__/
+.venv/
+venv/
