@@ -3,6 +3,8 @@
 작성일: 2026-08-16
 상태: 확정
 
+2026-08-16 구현 계획 사전 검토에서 결과 정책, `RESERVED` 재개 의미, 모듈 경계, 429 처리와 테스트 경계를 재확정했다.
+
 ## 1. 목적과 범위
 
 현재 수신번호별 `MMS(텍스트 + 이미지 2개)` 단건 발송 파이프라인을 다음의 2단계 파이프라인으로 변경한다.
@@ -77,6 +79,8 @@ worker 하나는 수신번호 하나를 성공, 최종 실패 또는 pending 상
 receiving_number,delivery_id,pipeline,delivery_status,is_sent,lms_status,lms_attempts,lms_request_id,lms_message_id,mms_status,mms_attempts,mms_request_id,mms_message_id,error
 ```
 
+이 14열 스키마는 `AGENTS.md` 최상위 structured result policy와 동일한 프로젝트 표준이다. 단계별 상태와 correlation ID를 별도 보조 파일에 분리하지 않으며 한 행을 단일 원자적 체크포인트로 사용한다.
+
 ### 4.1 파이프라인 구분
 
 `pipeline`은 다음 값만 사용한다.
@@ -94,6 +98,10 @@ receiving_number,delivery_id,pipeline,delivery_status,is_sent,lms_status,lms_att
 - `SENT`: `COMPLETED + success` 확인
 - `FAILED`: 허용된 실행에서 세 번째 명시적 실패 확인
 - `NOT_APPLICABLE`: 기존 통합 MMS 행의 LMS 단계에만 사용
+
+`RESERVED`는 해당 예약 이후의 POST가 아직 시작되지 않았음을 뜻한다. 해당 단계의 request/message ID는 비어 있고 attempts는 이전에 실제 시작된 POST 횟수만 센다. 재실행 시 `RESERVED`는 조회 대상이 아니며, 새 승인에 같은 단계의 진행이 포함되면 안전하게 POST를 계속할 수 있다.
+
+실제 POST 직전에는 전역 백오프와 중단 상태를 확인한 후 해당 단계를 `PENDING_CONFIRMATION`으로 바꾸고 attempts를 증가시켜 원자적으로 저장한다. 이 체크포인트 이후 프로세스가 중단되어 positive attempts와 blank correlation IDs가 남으면 실제 POST 여부가 모호하므로 자동 재POST하지 않는다.
 
 ### 4.3 전체 상태
 
@@ -128,13 +136,15 @@ MMS 실패 시에도 `lms_status=SENT`가 LMS의 부분 성공을 보존한다. 
 ### 5.1 신규 번호
 
 1. LMS 전송 직전 새 `delivery_id`와 LMS `RESERVED` 상태를 원자적으로 저장한다.
-2. POST 시도 직전에 `lms_attempts`를 증가시키고 이벤트를 기록한다.
-3. LMS POST가 접수되면 `lms_request_id`를 즉시 저장한다.
-4. 목록 조회로 `lms_message_id`를 찾는 즉시 저장한다.
-5. LMS가 `COMPLETED + success`이면 `lms_status=SENT`로 체크포인트한다.
-6. MMS 전송 직전 `mms_status=RESERVED`를 체크포인트한다.
-7. MMS도 같은 규칙으로 request/message ID와 상태를 저장한다.
-8. 두 단계가 모두 `SENT`일 때만 전체 `SENT`, `is_sent=true`, `error=null`로 확정한다.
+2. 전역 백오프 종료와 중단 상태를 확인한다.
+3. POST 시도 직전에 `lms_status=PENDING_CONFIRMATION`으로 바꾸고 `lms_attempts`를 증가시켜 체크포인트한 뒤 시작 이벤트를 기록한다.
+4. 전역 중단 상태를 다시 확인한 뒤 LMS POST를 수행한다.
+5. LMS POST가 접수되면 `lms_request_id`를 즉시 저장한다.
+6. 목록 조회로 `lms_message_id`를 찾는 즉시 저장한다.
+7. LMS가 `COMPLETED + success`이면 `lms_status=SENT`로 체크포인트한다.
+8. MMS 전송 직전 `mms_status=RESERVED`를 체크포인트한다.
+9. MMS도 같은 규칙으로 status, attempts, request/message ID를 저장한다.
+10. 두 단계가 모두 `SENT`일 때만 전체 `SENT`, `is_sent=true`, `error=null`로 확정한다.
 
 ### 5.2 LMS 실패 또는 pending
 
@@ -161,8 +171,10 @@ MMS 실패 시에도 `lms_status=SENT`가 LMS의 부분 성공을 보존한다. 
 
 재개 규칙은 다음과 같다.
 
+- LMS/MMS reserved: 해당 단계의 POST가 아직 시작되지 않았으므로 새 승인 범위 안에서 같은 단계부터 계속한다.
 - LMS pending: 기존 LMS만 조회하고 MMS는 보내지 않는다.
 - MMS pending: 기존 MMS만 조회하고 LMS와 MMS 모두 재POST하지 않는다.
+- positive attempts와 blank correlation IDs를 가진 pending: 모호한 POST로 보존하고 자동 재POST하지 않는다.
 - LMS 실패 재발송: 별도 승인과 새 `delivery_id` 후 LMS부터 시작한다.
 - LMS 성공·MMS 실패 재발송: 별도 승인과 새 `delivery_id` 후 LMS 기록은 유지하고 `mms_attempts`만 0부터 시작한다.
 - pending 조회 결과가 명시적 실패가 되고 남은 시도가 있는 경우, 사전 승인 화면이 동일 단계의 조건부 재시도를 명시적으로 포함했을 때만 재POST한다.
@@ -202,13 +214,26 @@ legacy 발송 행의 기존 `attempts`, `request_id`, `message_id`는 각각 `mm
 
 ### 8.2 구성 요소
 
-- `RecipientPipeline`: 한 수신번호의 LMS→MMS 상태 전이
-- `CheckpointCoordinator`: worker의 상태 변경을 직렬화하고 CSV를 원자적으로 교체
-- `EventCoordinator`: JSONL 순번과 기록을 직렬화
-- `RunSafetyCoordinator`: 공통 안전 실패를 모든 worker에 전파
+- `sens_mms/results.py`: 14열 행 검증, 원자적 저장, 8열 legacy 마이그레이션
+- `sens_mms/api.py`: 별도 `send_lms`/`send_mms` 요청과 조회 응답 분류
+- `sens_mms/coordination.py`: 아래 네 조정자를 제공
+  - `CheckpointCoordinator.commit(row)`: worker의 상태 변경을 직렬화하고 CSV를 원자적으로 교체
+  - `EventCoordinator.write(...)`: JSONL 순번과 기록을 직렬화
+  - `RunSafetyCoordinator.stop()`/`raise_if_stopped()`: 공통 안전 실패를 모든 worker에 전파
+  - `GlobalBackoff.before_call()`/`record_429()`: 실행 전체 API 호출 백오프를 조정
+- `sens_mms/pipeline.py`: `RecipientPipeline.run(row, approved_action, file_ids)`로 한 수신번호의 LMS→MMS 상태 전이를 전담
+- `sens_mms/workflow.py`: 승인 검증, pending 선조회, 조건부 이미지 업로드, 고정 worker pool과 완료 집계
 - 고정 worker pool: 동시에 최대 5개 수신번호만 처리
 
 SENS 클라이언트와 업로드된 두 `fileId`는 실행 동안 읽기 전용으로 공유한다.
+
+각 worker 입력은 다음 필드를 가진 불변 승인 작업으로 구성한다.
+
+- `initial_action=RECONCILE_LMS|RECONCILE_MMS|START_LMS|START_MMS`
+- `allow_followup_mms: bool`: LMS 성공 뒤 같은 승인으로 MMS 예약과 POST를 시작할 수 있는지 여부
+- `allow_retry_on_explicit_failure: bool`: 조회 또는 POST의 명시적 실패 뒤 같은 단계를 남은 횟수 안에서 재POST할 수 있는지 여부
+
+`initial_action`만으로 후속 POST 권한을 추정하지 않는다. `allow_followup_mms=false`인 LMS 조회/발송은 LMS 성공을 체크포인트한 뒤 멈추며, `allow_retry_on_explicit_failure=false`인 명시적 실패는 재POST 없이 보존한다. LMS 성공 전에는 어떤 승인 조합에서도 MMS 실행 경로에 진입하지 않는다. 이 세 필드는 단계별 대상과 함께 승인 토큰에 포함한다.
 
 ### 8.3 전역 중단 규칙
 
@@ -247,9 +272,10 @@ SENS 클라이언트와 업로드된 두 `fileId`는 실행 동안 읽기 전용
 HTTP 429가 발생하면 worker별 독립 재시도로 요청이 몰리지 않도록 실행 전체에 백오프를 적용한다.
 
 - 같은 실행의 첫 제한: 10초
-- 같은 실행에서 다시 제한: 20초
+- 같은 실행의 두 번째 이후 제한: 매번 최대 20초
 - 백오프 중에는 모든 worker의 새 POST/GET 시작을 잠시 멈춘다.
-- 429 응답이 POST 비접수를 명확히 나타내는 경우에만 해당 POST는 명시적 실패 시도에 포함한다.
+- GET의 429는 확인 창 안의 일시 조회 오류로 처리한다.
+- 메시지 POST가 HTTP 429 응답을 명확히 받은 경우에는 공식 공통 응답 정의에 따라 비접수로 분류하고 명시적 실패 시도에 포함한다. HTTP 응답 자체가 없는 타임아웃은 429로 추정하지 않고 모호한 결과로 처리한다.
 - API 제어 메시지 원문은 저장하지 않고 `redacted`로 정제한다.
 
 ## 10. 사전 승인
@@ -331,6 +357,16 @@ HTTP 429가 발생하면 worker별 독립 재시도로 요청이 몰리지 않�
 - legacy SENT 및 모든 pending의 중복 발송 차단
 - 결과 CSV 원자적 교체와 손상 복구
 - 승인 토큰 이후 입력, 이미지, 설정 또는 결과 변경 시 실행 차단
+
+### 12.5 테스트 모듈과 완료 기준
+
+- `tests/test_results.py`: 14열 불변식, 모든 대표 상태 조합, 8열 legacy 마이그레이션과 원자적 저장
+- `tests/test_coordination.py`: 동시 체크포인트, JSONL sequence, 전역 중단, 10초/20초 429 백오프
+- `tests/test_pipeline.py`: LMS→MMS 순서, 단계별 재시도/pending, `RESERVED` 재개와 승인 범위 차단
+- `tests/test_api.py`: LMS/MMS 요청 바디, UTF-8 본문 동등성, 빈 MMS content와 파일 순서, total sanitizer 회귀
+- `tests/test_workflow.py`, `tests/test_cli.py`: worker 최대 5개, pending 선조회, 조건부 업로드, 승인 토큰과 비식별 완료 보고
+
+동시성 테스트는 실제 대기 대신 thread-safe 가짜 clock, barrier와 scripted transport를 사용한다. 실제 SENS API, 실제 수신번호와 `.env`를 사용하지 않는다. 완료 기준은 `python -m unittest discover -s tests -v` 전체 통과와 모의 transport 기록을 통한 POST 순서 및 최대 동시 실행 수 검증이다.
 
 ## 13. 완료 보고
 
