@@ -96,8 +96,6 @@ def _completion_dict(summary, store, approved_at):
         ],
         "pending_follow_up_required": summary.pending > 0,
         "result_csv": str(store.path.resolve()),
-        "result_snapshot": str(summary.result_snapshot.resolve()),
-        "event_log": str(summary.event_log.resolve()),
         "live_send": True,
         "approved_at": approved_at,
     }
