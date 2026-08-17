@@ -1,12 +1,35 @@
-from dataclasses import dataclass, field
+import base64
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 import hashlib, json
+from typing import Literal
+
+from .coordination import RUN_SETTINGS
 from .inputs import load_recipients, validate_images, MESSAGE_BODY
 from .results import (
     ResultFormatError,
+    ResultRow,
     load_failed_candidates,
     select_latest_snapshot,
 )
+
+
+APPROVED_CONTENT_TYPE = "COMM"
+WorkAction = Literal[
+    "RECONCILE",
+    "RESUME_RESERVATION",
+    "START_FRESH",
+    "HOLD_AMBIGUOUS",
+    "RETRY_EXPLICIT",
+]
+
+
+@dataclass(frozen=True)
+class ApprovedWork:
+    receiving_number: str = field(repr=False)
+    action: WorkAction
+    allow_retry_after_explicit_failure: bool
+    source_delivery_id: str = field(default="", repr=False)
 
 
 @dataclass(frozen=True)
@@ -15,9 +38,11 @@ class PreflightReport:
     eligible_numbers: tuple
     eligible_rows: tuple
     pending_numbers: tuple
+    work_items: tuple
     masked_samples: tuple
     sender: str
     body: str
+    content_type: str
     images: tuple
     approved_images: tuple = field(repr=False)
     approval_token: str
@@ -26,6 +51,20 @@ class PreflightReport:
     resend_source_sha256: str | None
 
     def to_public_dict(self):
+        work_groups = {
+            "RECONCILE": tuple(
+                work for work in self.work_items if work.action == "RECONCILE"
+            ),
+            "RESUME_RESERVATION": tuple(
+                work for work in self.work_items if work.action == "RESUME_RESERVATION"
+            ),
+            "HOLD_AMBIGUOUS": tuple(
+                work for work in self.work_items if work.action == "HOLD_AMBIGUOUS"
+            ),
+            "START_FRESH": tuple(
+                work for work in self.work_items if work.action == "START_FRESH"
+            ),
+        }
         return {
             "total": self.total,
             "eligible_count": len(self.eligible_numbers),
@@ -33,16 +72,46 @@ class PreflightReport:
             "resend_source": self.resend_source,
             "resend_source_sha256": self.resend_source_sha256,
             "masked_samples": self.masked_samples,
-            "pending_reconciliation_count": len(self.pending_numbers),
-            "pending_masked_samples": tuple(
-                mask_number(n) for n in self.pending_numbers[:3]
+            "fresh_start_count": len(work_groups["START_FRESH"]),
+            "fresh_start_masked_samples": tuple(
+                mask_number(work.receiving_number)
+                for work in work_groups["START_FRESH"][:3]
             ),
-            "pending_explicit_failure_may_retry": bool(self.pending_numbers),
+            "pending_reconciliation_count": len(work_groups["RECONCILE"]),
+            "pending_masked_samples": tuple(
+                mask_number(work.receiving_number)
+                for work in work_groups["RECONCILE"][:3]
+            ),
+            "pending_explicit_failure_may_retry": any(
+                work.allow_retry_after_explicit_failure
+                for work in work_groups["RECONCILE"]
+            ),
+            "reservation_resume_count": len(work_groups["RESUME_RESERVATION"]),
+            "reservation_resume_masked_samples": tuple(
+                mask_number(work.receiving_number)
+                for work in work_groups["RESUME_RESERVATION"][:3]
+            ),
+            "ambiguous_hold_count": len(work_groups["HOLD_AMBIGUOUS"]),
+            "ambiguous_hold_masked_samples": tuple(
+                mask_number(work.receiving_number)
+                for work in work_groups["HOLD_AMBIGUOUS"][:3]
+            ),
             "sender": self.sender,
             "body": self.body,
             "type": "MMS",
-            "contentType": "COMM",
+            "subject": None,
+            "contentType": self.content_type,
             "images": self.images,
+            "settings": {
+                "worker_count": RUN_SETTINGS.worker_count,
+                "poll_interval_seconds": RUN_SETTINGS.poll_interval_seconds,
+                "confirmation_timeout_seconds": RUN_SETTINGS.confirmation_timeout_seconds,
+                "retry_delay_seconds": RUN_SETTINGS.retry_delay_seconds,
+                "max_attempts": RUN_SETTINGS.max_attempts,
+                "rate_limit_delays_seconds": list(
+                    RUN_SETTINGS.rate_limit_delays_seconds
+                ),
+            },
             "approval_token": self.approval_token,
         }
 
@@ -62,6 +131,33 @@ def result_row_identity(row):
         "message_id": row.message_id,
         "error": row.error,
     }
+
+
+def classify_existing(row: ResultRow) -> ApprovedWork:
+    if row.delivery_status != "PENDING_CONFIRMATION":
+        raise ResultFormatError("result row is not pending")
+    if row.attempts == 0:
+        return ApprovedWork(
+            row.receiving_number,
+            "RESUME_RESERVATION",
+            False,
+            row.delivery_id,
+        )
+    if not row.request_id:
+        if row.message_id:
+            raise ResultFormatError("pending result row has message_id without request_id")
+        return ApprovedWork(
+            row.receiving_number,
+            "HOLD_AMBIGUOUS",
+            False,
+            row.delivery_id,
+        )
+    return ApprovedWork(
+        row.receiving_number,
+        "RECONCILE",
+        row.attempts < RUN_SETTINGS.max_attempts,
+        row.delivery_id,
+    )
 
 
 def build_preflight(root, config, result_store, *, resend_failed=False):
@@ -118,28 +214,59 @@ def build_preflight(root, config, result_store, *, resend_failed=False):
         eligible = tuple(row.receiving_number for row in eligible_rows)
     else:
         eligible_rows = []
-        eligible = tuple(n for n in recipients.valid_numbers if n not in existing)
+        eligible = ()
     image_data = tuple(
         {
+            "order": order,
             "name": i.name,
             "bytes": i.bytes,
             "width": i.width,
             "height": i.height,
             "sha256": hashlib.sha256(i.data).hexdigest(),
         }
-        for i in images
+        for order, i in enumerate(images, start=1)
     )
-    pending = tuple(
-        n
-        for n in recipients.valid_numbers
-        if n in existing and existing[n].delivery_status == "PENDING_CONFIRMATION"
-    )
+    work_items = []
+    pending = []
+    resend_numbers = {row.receiving_number for row in eligible_rows}
+    for number in recipients.valid_numbers:
+        row = existing.get(number)
+        if row is None:
+            if not resend_failed:
+                work_items.append(ApprovedWork(number, "START_FRESH", True, ""))
+                eligible += (number,)
+            continue
+        if row.delivery_status == "PENDING_CONFIRMATION":
+            pending.append(number)
+            work_items.append(classify_existing(row))
+            continue
+        if resend_failed and number in resend_numbers:
+            work_items.append(ApprovedWork(number, "START_FRESH", True, row.delivery_id))
+    pending = tuple(pending)
+    work_items = tuple(work_items)
     canonical = {
         "sender": config.from_number,
         "body": MESSAGE_BODY,
-        "contentType": "COMM",
-        "images": image_data,
-        "pending": pending,
+        "type": "MMS",
+        "subject": None,
+        "contentType": APPROVED_CONTENT_TYPE,
+        "images": [
+            {
+                **metadata,
+                "dataBase64": base64.b64encode(image.data).decode("ascii"),
+            }
+            for metadata, image in zip(image_data, images)
+        ],
+        "workItems": [
+            {
+                "receivingNumber": work.receiving_number,
+                "action": work.action,
+                "allowRetryAfterExplicitFailure": work.allow_retry_after_explicit_failure,
+                "sourceDeliveryId": work.source_delivery_id,
+            }
+            for work in work_items
+        ],
+        "settings": asdict(RUN_SETTINGS),
         "existing": [
             result_row_identity(existing[number]) for number in sorted(existing)
         ],
@@ -160,9 +287,11 @@ def build_preflight(root, config, result_store, *, resend_failed=False):
         eligible_numbers=eligible,
         eligible_rows=tuple(eligible_rows),
         pending_numbers=pending,
+        work_items=work_items,
         masked_samples=tuple(mask_number(n) for n in eligible[:3]),
         sender=config.from_number,
         body=MESSAGE_BODY,
+        content_type=APPROVED_CONTENT_TYPE,
         images=image_data,
         approved_images=images,
         approval_token=token,

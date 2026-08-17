@@ -4,12 +4,14 @@ import hashlib
 import json
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
 from sens_mms.config import Config
+from sens_mms.coordination import RUN_SETTINGS
 from sens_mms.inputs import MESSAGE_BODY
-from sens_mms.preflight import build_preflight
+from sens_mms.preflight import ApprovedWork, build_preflight
 from sens_mms.results import (
     ResultFormatError,
     ResultRow,
@@ -101,6 +103,55 @@ def result_row(
     )
 
 
+def pending_with_ids(
+    number,
+    *,
+    attempts=1,
+    delivery_id=VALID_DELIVERY_ID,
+    request_id="request-1",
+    message_id="message-1",
+):
+    return result_row(
+        number,
+        status="PENDING_CONFIRMATION",
+        attempts=attempts,
+        delivery_id=delivery_id,
+        request_id=request_id,
+        message_id=message_id,
+    )
+
+
+def pending_reservation(number, *, delivery_id=VALID_DELIVERY_ID):
+    return pending_with_ids(
+        number,
+        attempts=0,
+        delivery_id=delivery_id,
+        request_id="",
+        message_id="",
+    )
+
+
+def pending_blank_ids(number, *, attempts=1, delivery_id=VALID_DELIVERY_ID):
+    return pending_with_ids(
+        number,
+        attempts=attempts,
+        delivery_id=delivery_id,
+        request_id="",
+        message_id="",
+    )
+
+
+def validation_failure_row(number):
+    return result_row(
+        number,
+        attempts=0,
+        request_id="",
+        message_id="",
+        error_status="VALIDATION_ERROR",
+        error_message="수신번호 검증 실패",
+    )
+
+
 def seed_current(root, rows):
     store = ResultStore.for_root(root)
     for row in rows:
@@ -122,6 +173,209 @@ def write_snapshot(root, name, rows):
 
 
 class PreflightTests(unittest.TestCase):
+    def test_preflight_classifies_pending_without_weakening_no_resend(self):
+        root = root_with_inputs((FIRST, SECOND, THIRD))
+        seed_current(
+            root,
+            (
+                pending_with_ids(FIRST, attempts=1, delivery_id="23456789ABCDEFGH"),
+                pending_reservation(SECOND, delivery_id="3456789ABCDEFGHJ"),
+                pending_blank_ids(THIRD, attempts=1, delivery_id="456789ABCDEFGHJK"),
+            ),
+        )
+
+        report = build_preflight(root, config(), ResultStore.for_root(root))
+
+        self.assertEqual(
+            tuple(
+                (
+                    work.receiving_number,
+                    work.action,
+                    work.allow_retry_after_explicit_failure,
+                    work.source_delivery_id,
+                )
+                for work in report.work_items
+            ),
+            (
+                (FIRST, "RECONCILE", True, "23456789ABCDEFGH"),
+                (SECOND, "RESUME_RESERVATION", False, "3456789ABCDEFGHJ"),
+                (THIRD, "HOLD_AMBIGUOUS", False, "456789ABCDEFGHJK"),
+            ),
+        )
+        self.assertEqual(report.pending_numbers, (FIRST, SECOND, THIRD))
+
+    def test_preflight_classifies_new_input_as_start_fresh_with_retry_allowed(self):
+        root = root_with_inputs((FIRST,))
+
+        report = build_preflight(root, config(), ResultStore.for_root(root))
+
+        self.assertEqual(
+            report.work_items,
+            (ApprovedWork(FIRST, "START_FRESH", True, ""),),
+        )
+        self.assertEqual(report.eligible_numbers, (FIRST,))
+        self.assertEqual(report.content_type, "COMM")
+
+    def test_preflight_excludes_sent_failed_and_validation_failure_rows_without_resend(self):
+        root = root_with_inputs((FIRST, SECOND, THIRD))
+        store = seed_current(
+            root,
+            (
+                result_row(FIRST, status="SENT"),
+                result_row(SECOND),
+                validation_failure_row(THIRD),
+            ),
+        )
+
+        report = build_preflight(root, config(), store)
+
+        self.assertEqual(report.work_items, ())
+        self.assertEqual(report.eligible_numbers, ())
+
+    def test_preflight_classifies_pending_request_only_as_reconcile(self):
+        root = root_with_inputs((FIRST,))
+        seed_current(
+            root,
+            (
+                pending_with_ids(
+                    FIRST,
+                    attempts=2,
+                    request_id="request-only",
+                    message_id="",
+                    delivery_id="23456789ABCDEFGH",
+                ),
+            ),
+        )
+
+        report = build_preflight(root, config(), ResultStore.for_root(root))
+
+        self.assertEqual(
+            report.work_items,
+            (ApprovedWork(FIRST, "RECONCILE", True, "23456789ABCDEFGH"),),
+        )
+
+    def test_preflight_rejects_pending_message_without_request_id(self):
+        root = root_with_inputs((FIRST,))
+        seed_current(
+            root,
+            (
+                pending_with_ids(
+                    FIRST,
+                    request_id="",
+                    message_id="message-without-request",
+                ),
+            ),
+        )
+
+        with self.assertRaisesRegex(
+            ResultFormatError,
+            "^pending result row has message_id without request_id$",
+        ):
+            build_preflight(root, config(), ResultStore.for_root(root))
+
+    def test_resend_preflight_classifies_snapshot_failed_rows_as_start_fresh(self):
+        root = root_with_inputs((FIRST, SECOND))
+        current = seed_current(
+            root,
+            (
+                result_row(FIRST, request_id="request-1", message_id="message-1"),
+                result_row(SECOND, request_id="request-2", message_id="message-2"),
+            ),
+        )
+        write_snapshot(
+            root,
+            "result_20260814_110000.csv",
+            (
+                validation_failure_row("not-a-number"),
+                result_row(FIRST, request_id="request-1", message_id="message-1"),
+                result_row(SECOND, request_id="request-2", message_id="message-2"),
+            ),
+        )
+
+        report = build_preflight(root, config(), current, resend_failed=True)
+
+        self.assertEqual(
+            report.work_items,
+            (
+                ApprovedWork(FIRST, "START_FRESH", True, VALID_DELIVERY_ID),
+                ApprovedWork(SECOND, "START_FRESH", True, VALID_DELIVERY_ID),
+            ),
+        )
+        self.assertEqual(report.eligible_numbers, (FIRST, SECOND))
+
+    def test_public_report_has_exact_body_sender_settings_and_only_masked_samples(self):
+        root = root_with_inputs((FIRST, SECOND, THIRD))
+        seed_current(
+            root,
+            (
+                pending_with_ids(FIRST, delivery_id="23456789ABCDEFGH"),
+                pending_reservation(SECOND, delivery_id="3456789ABCDEFGHJ"),
+                pending_blank_ids(THIRD, delivery_id="456789ABCDEFGHJK"),
+            ),
+        )
+
+        report = build_preflight(root, config(), ResultStore.for_root(root))
+        public = report.to_public_dict()
+
+        self.assertEqual(MESSAGE_BODY, EXPECTED_BODY)
+        self.assertEqual(public["body"], EXPECTED_BODY)
+        self.assertEqual(public["sender"], "0212345678")
+        self.assertEqual(public["type"], "MMS")
+        self.assertIsNone(public["subject"])
+        self.assertEqual(public["contentType"], "COMM")
+        self.assertEqual(
+            public["settings"],
+            {
+                "worker_count": 5,
+                "poll_interval_seconds": 1,
+                "confirmation_timeout_seconds": 120,
+                "retry_delay_seconds": 10,
+                "max_attempts": 3,
+                "rate_limit_delays_seconds": [10, 20],
+            },
+        )
+        self.assertEqual(public["pending_reconciliation_count"], 1)
+        self.assertEqual(public["pending_masked_samples"], ("*******1111",))
+        self.assertEqual(public["reservation_resume_count"], 1)
+        self.assertEqual(public["reservation_resume_masked_samples"], ("*******2222",))
+        self.assertEqual(public["ambiguous_hold_count"], 1)
+        self.assertEqual(public["ambiguous_hold_masked_samples"], ("*******3333",))
+        self.assertEqual(public["eligible_count"], 0)
+        self.assertEqual(public["masked_samples"], ())
+        self.assertEqual(public["images"][0]["order"], 1)
+        self.assertEqual(public["images"][1]["order"], 2)
+
+    def test_public_report_never_emits_private_identifiers(self):
+        root = root_with_inputs((FIRST, SECOND))
+        seed_current(
+            root,
+            (
+                pending_with_ids(FIRST, delivery_id="23456789ABCDEFGH"),
+                pending_reservation(SECOND, delivery_id="3456789ABCDEFGHJ"),
+            ),
+        )
+
+        public = build_preflight(
+            root, config(), ResultStore.for_root(root)
+        ).to_public_dict()
+        rendered = json.dumps(public, ensure_ascii=False)
+
+        for forbidden in (
+            FIRST,
+            SECOND,
+            "23456789ABCDEFGH",
+            "3456789ABCDEFGHJ",
+            "request-1",
+            "message-1",
+        ):
+            self.assertNotIn(forbidden, rendered)
+
+    def test_approved_work_hides_private_fields_in_repr(self):
+        work = ApprovedWork(FIRST, "RECONCILE", True, VALID_DELIVERY_ID)
+
+        self.assertNotIn(FIRST, repr(work))
+        self.assertNotIn(VALID_DELIVERY_ID, repr(work))
+
     def test_public_report_has_exact_body_sender_and_only_masked_recipient(self):
         root = root_with_inputs()
         report = build_preflight(root, config(), ResultStore.for_root(root))
@@ -144,6 +398,55 @@ class PreflightTests(unittest.TestCase):
 
         (root / "mms_img" / "mms_01_intro.jpg").write_bytes(jpeg(b"Z"))
         second = build_preflight(root, config(), store).approval_token
+
+        self.assertNotEqual(first, second)
+
+    def test_token_changes_when_work_item_action_retry_permission_or_source_delivery_id_changes(self):
+        root = root_with_inputs((FIRST,))
+        baseline_store = seed_current(root, (pending_with_ids(FIRST),))
+        first = build_preflight(root, config(), baseline_store).approval_token
+
+        hold_store = seed_current(root, (pending_blank_ids(FIRST),))
+        hold = build_preflight(root, config(), hold_store).approval_token
+
+        no_retry_store = seed_current(root, (pending_with_ids(FIRST, attempts=3),))
+        no_retry = build_preflight(root, config(), no_retry_store).approval_token
+
+        different_delivery_store = seed_current(
+            root,
+            (
+                pending_with_ids(
+                    FIRST,
+                    delivery_id="3456789ABCDEFGHJ",
+                ),
+            ),
+        )
+        different_delivery = build_preflight(
+            root, config(), different_delivery_store
+        ).approval_token
+
+        self.assertNotEqual(first, hold)
+        self.assertNotEqual(first, no_retry)
+        self.assertNotEqual(first, different_delivery)
+
+    def test_token_changes_when_run_settings_change(self):
+        root = root_with_inputs((FIRST,))
+        store = ResultStore.for_root(root)
+        first = build_preflight(root, config(), store).approval_token
+        changed_settings = replace(RUN_SETTINGS, retry_delay_seconds=11)
+
+        with patch("sens_mms.preflight.RUN_SETTINGS", changed_settings):
+            second = build_preflight(root, config(), store).approval_token
+
+        self.assertNotEqual(first, second)
+
+    def test_token_changes_when_approved_content_type_changes(self):
+        root = root_with_inputs((FIRST,))
+        store = ResultStore.for_root(root)
+        first = build_preflight(root, config(), store).approval_token
+
+        with patch("sens_mms.preflight.APPROVED_CONTENT_TYPE", "AD"):
+            second = build_preflight(root, config(), store).approval_token
 
         self.assertNotEqual(first, second)
 
