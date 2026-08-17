@@ -301,6 +301,62 @@ class PipelineTests(unittest.TestCase):
         with self.assertRaises(RunSafetyError):
             coordinator.raise_if_stopped()
 
+    def test_send_attempt_started_event_failure_preserves_attempt_and_starts_no_post(self):
+        """Catches a failed SEND_ATTEMPT_STARTED write being swallowed before POST."""
+        row = reservation()
+        log = RecordingEventLog(fail_event="SEND_ATTEMPT_STARTED")
+        api = ScriptedPipelineApi(
+            sends=(send_response(),),
+            lists=(list_response(message("READY")),),
+            gets=(result_response(message("COMPLETED", "success")),),
+        )
+        pipeline, _, _, coordinator = self.make_pipeline(api, row, event_log=log)
+
+        with self.assertRaisesRegex(OSError, "event unavailable"):
+            pipeline.run(row, work(), ("file-1", "file-2"))
+
+        persisted = self.persisted()
+        self.assertEqual(api.calls, [])
+        self.assertEqual(
+            (
+                persisted.delivery_status,
+                persisted.attempts,
+                persisted.request_id,
+                persisted.message_id,
+            ),
+            ("PENDING_CONFIRMATION", 1, "", ""),
+        )
+        with self.assertRaises(RunSafetyError):
+            coordinator.raise_if_stopped()
+
+    def test_send_response_event_failure_preserves_request_and_starts_no_lookup(self):
+        """Catches a failed SEND_RESPONSE write allowing list/get after acceptance."""
+        row = reservation()
+        log = RecordingEventLog(fail_event="SEND_RESPONSE")
+        api = ScriptedPipelineApi(
+            sends=(send_response(),),
+            lists=(list_response(message("READY")),),
+            gets=(result_response(message("COMPLETED", "success")),),
+        )
+        pipeline, _, _, coordinator = self.make_pipeline(api, row, event_log=log)
+
+        with self.assertRaisesRegex(OSError, "event unavailable"):
+            pipeline.run(row, work(), ("file-1", "file-2"))
+
+        persisted = self.persisted()
+        self.assertEqual([call[0] for call in api.calls], ["send"])
+        self.assertEqual(
+            (
+                persisted.delivery_status,
+                persisted.attempts,
+                persisted.request_id,
+                persisted.message_id,
+            ),
+            ("PENDING_CONFIRMATION", 1, "request-1", ""),
+        )
+        with self.assertRaises(RunSafetyError):
+            coordinator.raise_if_stopped()
+
     def test_stop_after_reservation_starts_no_post_and_preserves_attempt_zero(self):
         """Catches a worker continuing after reservation publication globally stopped."""
         row = reservation()

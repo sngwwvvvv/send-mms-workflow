@@ -530,6 +530,81 @@ class ApiTests(unittest.TestCase):
         self.assertFalse(hasattr(actual.messages[0], "content"))
         self.assertFalse(hasattr(actual.messages[0], "files"))
 
+    def test_message_type_accepts_only_exact_builtin_strings_without_hostile_calls(self):
+        """Catches permissive message-type filtering retaining hostile string subclasses."""
+        calls = []
+
+        class HostileText(str):
+            def _called(self, name):
+                calls.append(name)
+                raise RuntimeError("HOSTILE_MESSAGE_TYPE_MARKER")
+
+            def __str__(self):
+                return self._called("str")
+
+            def __repr__(self):
+                return self._called("repr")
+
+            def __eq__(self, other):
+                return self._called("eq")
+
+            def __bool__(self):
+                return self._called("bool")
+
+            def __len__(self):
+                return self._called("len")
+
+            def __iter__(self):
+                return self._called("iter")
+
+        class HostileValue:
+            def _called(self, name):
+                calls.append(name)
+                raise RuntimeError("HOSTILE_MESSAGE_TYPE_MARKER")
+
+            def __str__(self):
+                return self._called("str")
+
+            def __repr__(self):
+                return self._called("repr")
+
+            def __eq__(self, other):
+                return self._called("eq")
+
+            def __bool__(self):
+                return self._called("bool")
+
+            def __len__(self):
+                return self._called("len")
+
+            def __iter__(self):
+                return self._called("iter")
+
+        cases = (
+            ("exact", "MMS", "MMS"),
+            ("subclass", HostileText("MMS"), ""),
+            ("object", HostileValue(), ""),
+        )
+        operations = (
+            ("list", "202", lambda sens: sens.list_by_request("request-1").messages[0]),
+            ("get", "200", lambda sens: sens.get_message("message-1").message),
+        )
+        for case_name, supplied, expected in cases:
+            for operation_name, envelope_code, operation in operations:
+                with self.subTest(case=case_name, operation=operation_name):
+                    payload = {
+                        "statusCode": envelope_code,
+                        "statusName": "success",
+                        "messages": [official_message(type=supplied)],
+                    }
+                    sens = client(RecordingTransport([]))
+                    sens._request_json = lambda method, uri, value=payload: (200, value)
+
+                    actual = operation(sens).message_type
+
+                    self.assertTrue(type(actual) is str and actual == expected)
+        self.assertEqual(calls, [])
+
     def test_list_preserves_none_for_absent_optional_page_fields(self):
         transport = RecordingTransport([response(200, {
             "statusCode": "202", "statusName": "success", "messages": []
