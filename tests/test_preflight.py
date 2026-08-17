@@ -6,12 +6,13 @@ import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from typing import get_type_hints
 from unittest.mock import patch
 
 from sens_mms.config import Config
 from sens_mms.coordination import RUN_SETTINGS
-from sens_mms.inputs import MESSAGE_BODY
-from sens_mms.preflight import ApprovedWork, build_preflight
+from sens_mms.inputs import ImageInfo, MESSAGE_BODY
+from sens_mms.preflight import ApprovedWork, PreflightReport, build_preflight
 from sens_mms.results import (
     ResultFormatError,
     ResultRow,
@@ -173,6 +174,12 @@ def write_snapshot(root, name, rows):
 
 
 class PreflightTests(unittest.TestCase):
+    def test_preflight_report_exposes_immutable_approved_work_items(self):
+        """Catches callers losing the ApprovedWork action contract to bare tuple."""
+        hints = get_type_hints(PreflightReport)
+
+        self.assertEqual(hints["work_items"], tuple[ApprovedWork, ...])
+
     def test_preflight_classifies_pending_without_weakening_no_resend(self):
         root = root_with_inputs((FIRST, SECOND, THIRD))
         seed_current(
@@ -342,8 +349,31 @@ class PreflightTests(unittest.TestCase):
         self.assertEqual(public["ambiguous_hold_masked_samples"], ("*******3333",))
         self.assertEqual(public["eligible_count"], 0)
         self.assertEqual(public["masked_samples"], ())
-        self.assertEqual(public["images"][0]["order"], 1)
-        self.assertEqual(public["images"][1]["order"], 2)
+        self.assertEqual(
+            public["images"],
+            (
+                {
+                    "order": 1,
+                    "name": "mms_01_intro.jpg",
+                    "bytes": len(jpeg(b"A")),
+                    "width": 10,
+                    "height": 10,
+                    "sha256": hashlib.sha256(jpeg(b"A")).hexdigest(),
+                },
+                {
+                    "order": 2,
+                    "name": "mms_02_details.jpg",
+                    "bytes": len(jpeg(b"B")),
+                    "width": 10,
+                    "height": 10,
+                    "sha256": hashlib.sha256(jpeg(b"B")).hexdigest(),
+                },
+            ),
+        )
+        self.assertEqual(
+            tuple(image.data for image in report.approved_images),
+            (jpeg(b"A"), jpeg(b"B")),
+        )
 
     def test_public_report_never_emits_private_identifiers(self):
         root = root_with_inputs((FIRST, SECOND))
@@ -429,16 +459,82 @@ class PreflightTests(unittest.TestCase):
         self.assertNotEqual(first, no_retry)
         self.assertNotEqual(first, different_delivery)
 
-    def test_token_changes_when_run_settings_change(self):
+    def test_token_changes_when_each_fixed_run_setting_changes(self):
+        """Catches a canonical token that omits any worker run setting."""
         root = root_with_inputs((FIRST,))
         store = ResultStore.for_root(root)
         first = build_preflight(root, config(), store).approval_token
-        changed_settings = replace(RUN_SETTINGS, retry_delay_seconds=11)
+        mutations = (
+            {"worker_count": 6},
+            {"poll_interval_seconds": 2},
+            {"confirmation_timeout_seconds": 121},
+            {"retry_delay_seconds": 11},
+            {"max_attempts": 4},
+            {"rate_limit_delays_seconds": (11, 20)},
+            {"rate_limit_delays_seconds": (10, 21)},
+        )
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                with patch(
+                    "sens_mms.preflight.RUN_SETTINGS",
+                    replace(RUN_SETTINGS, **mutation),
+                ):
+                    changed = build_preflight(root, config(), store).approval_token
 
-        with patch("sens_mms.preflight.RUN_SETTINGS", changed_settings):
-            second = build_preflight(root, config(), store).approval_token
+                self.assertNotEqual(first, changed)
 
-        self.assertNotEqual(first, second)
+    def test_token_changes_when_body_changes(self):
+        """Catches a canonical token that omits the operator-approved body."""
+        root = root_with_inputs((FIRST,))
+        store = ResultStore.for_root(root)
+        first = build_preflight(root, config(), store).approval_token
+
+        with patch("sens_mms.preflight.MESSAGE_BODY", "operator-approved body changed"):
+            changed_report = build_preflight(root, config(), store)
+
+        self.assertEqual(changed_report.body, "operator-approved body changed")
+        self.assertNotEqual(first, changed_report.approval_token)
+
+    def test_token_changes_when_public_image_metadata_changes(self):
+        """Catches canonicalization that omits image name, size, dimensions, hash, or order."""
+        root = root_with_inputs((FIRST,))
+        store = ResultStore.for_root(root)
+        first = build_preflight(root, config(), store)
+        original_images = first.approved_images
+        mutations = (
+            ImageInfo(
+                "renamed.jpg", original_images[0].path, original_images[0].data, 10, 10
+            ),
+            ImageInfo(
+                "mms_01_intro.jpg",
+                original_images[0].path,
+                jpeg(b"Z") + b"\x00",
+                10,
+                10,
+            ),
+            ImageInfo(
+                "mms_01_intro.jpg", original_images[0].path, original_images[0].data, 11, 10
+            ),
+            ImageInfo(
+                "mms_01_intro.jpg", original_images[0].path, original_images[0].data, 10, 11
+            ),
+        )
+        for mutated_first_image in mutations:
+            with self.subTest(image=mutated_first_image):
+                with patch(
+                    "sens_mms.preflight.validate_images",
+                    return_value=(mutated_first_image, original_images[1]),
+                ):
+                    changed = build_preflight(root, config(), store)
+
+                self.assertNotEqual(first.approval_token, changed.approval_token)
+
+        with patch(
+            "sens_mms.preflight.validate_images",
+            return_value=(original_images[1], original_images[0]),
+        ):
+            reordered = build_preflight(root, config(), store)
+        self.assertNotEqual(first.approval_token, reordered.approval_token)
 
     def test_token_changes_when_approved_content_type_changes(self):
         root = root_with_inputs((FIRST,))
@@ -872,27 +968,31 @@ class PreflightTests(unittest.TestCase):
                 ):
                     build_preflight(root, config(), current, resend_failed=True)
 
-    def test_approval_token_binds_every_exact_existing_row_field(self):
-        changes = (
-            {"delivery_id": "3456789ABCDEFGHJ"},
-            {"attempts": 2},
-            {"error_status": "3002", "error_message": "different failure"},
+    def test_approval_token_binds_every_valid_result_row_field(self):
+        """Catches an approval token that omits a checkpoint identity field."""
+        root = root_with_inputs((FIRST, SECOND))
+        original = seed_current(root, (result_row(FIRST),))
+        first_token = build_preflight(root, config(), original).approval_token
+        valid_mutations = (
+            result_row(SECOND),
+            result_row(FIRST, delivery_id="3456789ABCDEFGHJ"),
+            result_row(FIRST, status="SENT"),
+            result_row(FIRST, status="PENDING_CONFIRMATION", attempts=1),
+            result_row(FIRST, attempts=2),
+            result_row(FIRST, request_id="request-2"),
+            result_row(FIRST, message_id="message-2"),
+            result_row(
+                FIRST,
+                error_status="3002",
+                error_message="different failure",
+            ),
         )
-        for changed_fields in changes:
-            with self.subTest(changed_fields=changed_fields):
-                root = root_with_inputs((FIRST,))
-                original = seed_current(root, (result_row(FIRST),))
-                first_token = build_preflight(root, config(), original).approval_token
-                changed = seed_current(
-                    root,
-                    (result_row(FIRST, **changed_fields),),
-                )
+        for changed_row in valid_mutations:
+            with self.subTest(changed_row=changed_row):
+                changed = seed_current(root, (changed_row,))
+                changed_token = build_preflight(root, config(), changed).approval_token
 
-                second_token = build_preflight(
-                    root, config(), changed
-                ).approval_token
-
-                self.assertNotEqual(first_token, second_token)
+                self.assertNotEqual(first_token, changed_token)
 
 
 if __name__ == "__main__":

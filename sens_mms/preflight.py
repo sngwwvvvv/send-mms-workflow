@@ -38,7 +38,7 @@ class PreflightReport:
     eligible_numbers: tuple
     eligible_rows: tuple
     pending_numbers: tuple
-    work_items: tuple
+    work_items: tuple[ApprovedWork, ...]
     masked_samples: tuple
     sender: str
     body: str
