@@ -45,6 +45,12 @@ class ApprovalTokenMismatch(ValueError):
     pass
 
 
+@dataclass(frozen=True)
+class _ApprovedSend:
+    work: ApprovedWork
+    reconciled_row: ResultRow | None = None
+
+
 class Workflow:
     def __init__(
         self,
@@ -128,7 +134,7 @@ class Workflow:
         send_items = []
         for work in report.work_items:
             if work.action in {"START_FRESH", "RESUME_RESERVATION"}:
-                send_items.append(work)
+                send_items.append(_ApprovedSend(work))
             elif work.action == "RECONCILE":
                 result = reconciled.get(work.receiving_number)
                 if (
@@ -138,11 +144,14 @@ class Workflow:
                     and work.allow_retry_after_explicit_failure is True
                 ):
                     send_items.append(
-                        ApprovedWork(
-                            receiving_number=work.receiving_number,
-                            action="RETRY_EXPLICIT",
-                            allow_retry_after_explicit_failure=True,
-                            source_delivery_id=result.row.delivery_id,
+                        _ApprovedSend(
+                            ApprovedWork(
+                                receiving_number=work.receiving_number,
+                                action="RETRY_EXPLICIT",
+                                allow_retry_after_explicit_failure=True,
+                                source_delivery_id=result.row.delivery_id,
+                            ),
+                            reconciled_row=result.row,
                         )
                     )
 
@@ -275,7 +284,7 @@ class Workflow:
     def _publish_reservations(
         self,
         report: PreflightReport,
-        send_items: Sequence[ApprovedWork],
+        send_items: Sequence[_ApprovedSend],
     ) -> tuple[tuple[ResultRow, ApprovedWork], ...]:
         items = tuple(send_items)
         current_rows = self.coordinator.read_rows()
@@ -284,18 +293,29 @@ class Workflow:
         }
         expected = {}
         seen_numbers = set()
-        for work in items:
+        for item in items:
+            work = item.work
             number = work.receiving_number
             if number in seen_numbers:
                 raise ResultFormatError("duplicate approved send work")
             seen_numbers.add(number)
             current = current_rows.get(number)
-            expected[number] = current
-            self._validate_approved_send_row(work, current, candidates)
+            if work.action == "RETRY_EXPLICIT":
+                approved = item.reconciled_row
+                if approved is None or current != approved:
+                    raise ResultFormatError(
+                        "approved retry row does not match current checkpoint"
+                    )
+                expected[number] = approved
+                self._validate_approved_send_row(work, approved, candidates)
+            else:
+                expected[number] = current
+                self._validate_approved_send_row(work, current, candidates)
 
         existing_ids = collect_delivery_ids(self.store.path.parent)
         fresh_rows = {}
-        for work in items:
+        for item in items:
+            work = item.work
             if work.action != "START_FRESH":
                 continue
             row = self._new_reservation(work.receiving_number, existing_ids)
@@ -304,10 +324,17 @@ class Workflow:
 
         replacements = []
         jobs = []
-        for work in items:
+        for item in items:
+            work = item.work
             if work.action == "START_FRESH":
                 row = fresh_rows[work.receiving_number]
                 replacements.append(row)
+            elif work.action == "RETRY_EXPLICIT":
+                row = item.reconciled_row
+                if row is None:
+                    raise ResultFormatError(
+                        "approved retry row does not match current checkpoint"
+                    )
             else:
                 row = current_rows[work.receiving_number]
                 if work.action == "RESUME_RESERVATION":

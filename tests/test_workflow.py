@@ -306,21 +306,6 @@ class ScriptedApi:
         return value
 
 
-class ObservingUploadApi(ScriptedApi):
-    def __init__(self, *, root, **kwargs):
-        super().__init__(**kwargs)
-        self.root = root
-        self.rows_seen_at_upload = []
-
-    def upload_file(self, path):
-        self.rows_seen_at_upload.append(ResultStore.for_root(self.root).load())
-        return super().upload_file(path)
-
-    def upload_bytes(self, name, data):
-        self.rows_seen_at_upload.append(ResultStore.for_root(self.root).load())
-        return super().upload_bytes(name, data)
-
-
 class BlockingUploadApi(ScriptedApi):
     def __init__(self, *, entered, release, **kwargs):
         super().__init__(**kwargs)
@@ -457,11 +442,13 @@ class OrchestrationApi:
         pending_done=None,
         send_barrier=None,
         pending_barrier=None,
+        on_upload=None,
     ):
         self._lock = threading.Lock()
         self._pending_done = pending_done
         self._send_barrier = send_barrier
         self._pending_barrier = pending_barrier
+        self._on_upload = on_upload
         self._barrier_entries = 0
         self._pending_barrier_entries = 0
         self._upload_failures = list(upload_failures)
@@ -514,6 +501,8 @@ class OrchestrationApi:
             upload_number = len(self.uploaded)
         if failure is not None:
             raise failure
+        if self._on_upload is not None:
+            self._on_upload(upload_number)
         return f"file-{upload_number}"
 
     def send_one(self, to, file_ids, *, content_type):
@@ -935,6 +924,57 @@ class WorkflowTests(unittest.TestCase):
                 self.assertEqual(len(api.uploaded), expected_uploads)
                 self.assertEqual(len(api.sent), expected_sends)
                 self.assertEqual(clock.sleeps.count(RUN_SETTINGS.retry_delay_seconds), expected_sends)
+
+    def test_retry_rejects_any_reconciled_row_change_during_upload(self):
+        """Catches a retry silently adopting a changed durable row after approval."""
+        mutations = (
+            ("attempts", {"attempts": 2}),
+            ("request_id", {"request_id": "changed-request"}),
+            ("message_id", {"message_id": "changed-message"}),
+        )
+        for label, changes in mutations:
+            with self.subTest(field=label):
+                number = "01000000014"
+                root = make_root((number,))
+                row = pending_result(
+                    number,
+                    "CCCCCCCCCCCCCCC6",
+                    attempts=1,
+                )
+                store = ResultStore.for_root(root)
+                store.upsert(row)
+                store.write_atomic()
+                changed = replace(row, **changes)
+
+                def mutate_checkpoint(upload_number):
+                    if upload_number != 1:
+                        return
+                    outside_writer = ResultStore.for_root(root)
+                    outside_writer.upsert(changed)
+                    outside_writer.write_atomic()
+
+                api = OrchestrationApi(
+                    pending=((row, ("fail",)),),
+                    send_outcomes={number: ("success",)},
+                    on_upload=mutate_checkpoint,
+                )
+                workflow = make_workflow(
+                    root,
+                    store,
+                    api,
+                    clock=ThreadSafeClock(),
+                    delivery_id_factory=FixedIdFactory(),
+                )
+
+                with self.assertRaisesRegex(
+                    ResultFormatError,
+                    "approved retry row does not match current checkpoint",
+                ):
+                    workflow.run_live(workflow.current_token())
+
+                self.assertEqual(len(api.uploaded), 2)
+                self.assertEqual(api.sent, [])
+                self.assertEqual(ResultStore.for_root(root).load()[number], changed)
 
     def test_upload_failure_and_429_never_retry_upload_or_start_message_post(self):
         """Catches attachment retries and POST continuation after uncertain upload failure."""
@@ -1944,33 +1984,17 @@ class WorkflowTests(unittest.TestCase):
         )
         store = RecordingResultStore(seeded.path)
         store.load()
-        api = ScriptedApi(
-            sends=[send_response(), send_response("request-2")],
-            lists=[
-                list_response(message("PROCESSING")),
-                list_response(message(
-                    "PROCESSING",
-                    request_id="request-2",
-                    message_id="message-2",
-                    to=second,
-                )),
-            ],
-            gets=[
-                result_response(message("COMPLETED", "success", "0")),
-                result_response(message(
-                    "COMPLETED",
-                    "success",
-                    "0",
-                    request_id="request-2",
-                    message_id="message-2",
-                    to=second,
-                )),
-            ],
+        api = OrchestrationApi(
+            send_outcomes={
+                RECIPIENT: ("success",),
+                second: ("success",),
+            },
         )
         workflow = make_workflow(
             root,
             store,
             api,
+            clock=ThreadSafeClock(),
             delivery_id_factory=FixedIdFactory(DELIVERY_ID_3, DELIVERY_ID_4),
             resend_failed=True,
         )
@@ -2070,41 +2094,30 @@ class WorkflowTests(unittest.TestCase):
                 failed_result(second, DELIVERY_ID_2, "request-2", "message-2"),
             ),
         )
-        api = ObservingUploadApi(
-            root=root,
-            sends=[send_response(), send_response("request-2")],
-            lists=[
-                list_response(message("PROCESSING")),
-                list_response(message(
-                    "PROCESSING",
-                    request_id="request-2",
-                    message_id="message-2",
-                    to=second,
-                )),
-            ],
-            gets=[
-                result_response(message("COMPLETED", "success", "0")),
-                result_response(message(
-                    "COMPLETED",
-                    "success",
-                    "0",
-                    request_id="request-2",
-                    message_id="message-2",
-                    to=second,
-                )),
-            ],
+        rows_seen_at_upload = []
+
+        def observe_checkpoint(_upload_number):
+            rows_seen_at_upload.append(ResultStore.for_root(root).load())
+
+        api = OrchestrationApi(
+            send_outcomes={
+                RECIPIENT: ("success",),
+                second: ("success",),
+            },
+            on_upload=observe_checkpoint,
         )
         workflow = make_workflow(
             root,
             store,
             api,
+            clock=ThreadSafeClock(),
             delivery_id_factory=FixedIdFactory(DELIVERY_ID_3, DELIVERY_ID_4),
             resend_failed=True,
         )
 
         workflow.run_live(workflow.current_token())
 
-        rows_at_first_upload = api.rows_seen_at_upload[0]
+        rows_at_first_upload = rows_seen_at_upload[0]
         self.assertEqual(set(rows_at_first_upload), {RECIPIENT, second})
         self.assertEqual(
             {
@@ -2440,26 +2453,17 @@ class WorkflowTests(unittest.TestCase):
     def test_two_recipients_receive_distinct_ids_and_share_one_ordered_file_pair(self):
         second = "01099998888"
         root = make_root((RECIPIENT, second))
-        api = ScriptedApi(
-            sends=[send_response(), send_response("request-2")],
-            lists=[
-                list_response(message("PROCESSING")),
-                list_response(message(
-                    "PROCESSING", request_id="request-2", message_id="message-2", to=second
-                )),
-            ],
-            gets=[
-                result_response(message("COMPLETED", "success", "0")),
-                result_response(message(
-                    "COMPLETED", "success", "0",
-                    request_id="request-2", message_id="message-2", to=second,
-                )),
-            ],
+        api = OrchestrationApi(
+            send_outcomes={
+                RECIPIENT: ("success",),
+                second: ("success",),
+            },
         )
         workflow = make_workflow(
             root,
             ResultStore.for_root(root),
             api,
+            clock=ThreadSafeClock(),
             delivery_id_factory=FixedIdFactory(DELIVERY_ID_1, DELIVERY_ID_2),
         )
 
@@ -2471,11 +2475,17 @@ class WorkflowTests(unittest.TestCase):
             {rows[RECIPIENT].delivery_id, rows[second].delivery_id},
             {DELIVERY_ID_1, DELIVERY_ID_2},
         )
-        self.assertEqual(api.uploaded, ["mms_01_intro.jpg", "mms_02_details.jpg"])
-        self.assertEqual(api.sent, [
-            (RECIPIENT, ("file-1", "file-2")),
-            (second, ("file-1", "file-2")),
-        ])
+        self.assertEqual(
+            [name for name, _data in api.uploaded],
+            ["mms_01_intro.jpg", "mms_02_details.jpg"],
+        )
+        self.assertEqual(
+            {(number, files) for number, files, _content_type in api.sent},
+            {
+                (RECIPIENT, ("file-1", "file-2")),
+                (second, ("file-1", "file-2")),
+            },
+        )
 
     def test_three_completed_failures_become_failed_with_last_delivery_error(self):
         root = make_root()
@@ -3246,13 +3256,13 @@ class WorkflowTests(unittest.TestCase):
         root = make_root((RECIPIENT, second))
         original = EventLogError("event log write failed")
         log = FailingEventLog(root, {"SEND_RESPONSE": [original]})
-        api = ScriptedApi(
-            sends=[send_response(), send_response("request-2")],
-            lists=[],
-            gets=[],
-        )
+        api = OrchestrationApi()
         workflow = make_workflow(
-            root, ResultStore.for_root(root), api, event_log=log
+            root,
+            ResultStore.for_root(root),
+            api,
+            clock=ThreadSafeClock(),
+            event_log=log,
         )
 
         with self.assertRaises(EventLogError) as raised:
@@ -3277,26 +3287,18 @@ class WorkflowTests(unittest.TestCase):
         root = make_root((RECIPIENT, second))
         original = EventLogError("event log write failed")
         log = FailingEventLog(root, {"SEND_AMBIGUOUS_OUTCOME": [original]})
-        api = ScriptedApi(
-            sends=[AmbiguousPostOutcome("response lost"), send_response("request-2")],
-            lists=[list_response(message(
-                "PROCESSING",
-                request_id="request-2",
-                message_id="message-2",
-                to=second,
-            ))],
-            gets=[result_response(message(
-                "COMPLETED",
-                "success",
-                "0",
-                request_id="request-2",
-                message_id="message-2",
-                to=second,
-            ))],
-            time_lists=[list_response()],
+        api = OrchestrationApi(
+            send_outcomes={
+                RECIPIENT: (AmbiguousPostOutcome("response lost"),),
+                second: ("success",),
+            },
         )
         workflow = make_workflow(
-            root, ResultStore.for_root(root), api, event_log=log
+            root,
+            ResultStore.for_root(root),
+            api,
+            clock=ThreadSafeClock(),
+            event_log=log,
         )
 
         with self.assertRaises(EventLogError) as raised:
@@ -3306,7 +3308,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertIs(raised.exception, original)
         self.assertLessEqual(1, len(api.sent))
         self.assertLessEqual(len(api.sent), 2)
-        self.assertEqual(api.time_listed, [])
+        self.assertFalse(any(label.endswith(":time-list") for label in api.trace))
         self.assertEqual(set(rows), {RECIPIENT, second})
         self.assertTrue(any(
             row.attempts == 1 and row.request_id == ""
@@ -3321,19 +3323,26 @@ class WorkflowTests(unittest.TestCase):
         root = make_root((RECIPIENT, second))
         store = FailingCheckpointStore(ResultStore.for_root(root).path, fail_on_write=3)
         log = RecordingEventLog(root)
-        api = ScriptedApi(
-            sends=[send_response(), send_response("request-2")],
-            lists=[],
-            gets=[],
+        api = OrchestrationApi()
+        workflow = make_workflow(
+            root,
+            store,
+            api,
+            clock=ThreadSafeClock(),
+            event_log=log,
         )
-        workflow = make_workflow(root, store, api, event_log=log)
 
         with self.assertRaisesRegex(OSError, "checkpoint unavailable"):
             workflow.run_live(workflow.current_token())
 
-        persisted = ResultStore.for_root(root).load()[RECIPIENT]
-        self.assertEqual(len(api.sent), 1)
-        self.assertEqual((persisted.attempts, persisted.request_id), (1, ""))
+        persisted = ResultStore.for_root(root).load()
+        attempted = [
+            row
+            for row in persisted.values()
+            if row.attempts == 1 and row.request_id == ""
+        ]
+        self.assertLessEqual(len(api.sent), 1)
+        self.assertEqual(len(attempted), 1)
         self.assertNotIn("WORKFLOW_COMPLETED", [event for event, _ in log.events])
         self.assertEqual(list((root / "results").glob("result_*.csv")), [])
         self.assert_event_privacy(log, second)
