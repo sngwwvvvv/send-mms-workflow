@@ -28,6 +28,7 @@ SEOUL = ZoneInfo("Asia/Seoul")
 _SEND_ACTIONS = frozenset(
     {"RESUME_RESERVATION", "START_FRESH", "RETRY_EXPLICIT"}
 )
+_WORK_ACTIONS = _SEND_ACTIONS | frozenset({"HOLD_AMBIGUOUS", "RECONCILE"})
 
 
 @dataclass(frozen=True)
@@ -58,19 +59,62 @@ class RecipientPipeline:
     ) -> PipelineResult:
         if not self._exact_equal(row.receiving_number, work.receiving_number):
             raise ResultFormatError("approved work recipient mismatch")
-        if work.action == "HOLD_AMBIGUOUS":
-            return PipelineResult(row)
-        if work.action == "RECONCILE":
-            return self._reconcile(row, work)
-        if work.action not in _SEND_ACTIONS:
+        action = work.action
+        if type(action) is not str or action not in _WORK_ACTIONS:
             raise ResultFormatError("approved work action invalid")
-        if (
-            row.attempts > 0
-            and not self._nonempty_exact_string(row.request_id)
-            and not self._nonempty_exact_string(row.message_id)
-        ):
+        if action == "HOLD_AMBIGUOUS":
+            return PipelineResult(row)
+        if action == "RECONCILE":
+            if not self._is_legal_reconciliation(row):
+                return PipelineResult(row)
+            return self._reconcile(row, work)
+        if not self._is_legal_send(row, work):
             return PipelineResult(row)
         return self._send(row, work, tuple(file_ids))
+
+    @classmethod
+    def _is_pending_base(cls, row: ResultRow) -> bool:
+        return (
+            type(row.delivery_status) is str
+            and row.delivery_status == "PENDING_CONFIRMATION"
+            and type(row.is_sent) is str
+            and row.is_sent == ""
+            and row.error is None
+            and cls._nonempty_exact_string(row.delivery_id)
+            and type(row.attempts) is int
+            and row.attempts >= 0
+        )
+
+    @classmethod
+    def _is_legal_send(cls, row: ResultRow, work: ApprovedWork) -> bool:
+        if not cls._is_pending_base(row):
+            return False
+        action = work.action
+        if action in {"START_FRESH", "RESUME_RESERVATION"}:
+            return (
+                row.attempts == 0
+                and type(row.request_id) is str
+                and row.request_id == ""
+                and type(row.message_id) is str
+                and row.message_id == ""
+            )
+        return (
+            action == "RETRY_EXPLICIT"
+            and work.allow_retry_after_explicit_failure is True
+            and 0 < row.attempts < RUN_SETTINGS.max_attempts
+            and cls._nonempty_exact_string(row.request_id)
+            and cls._nonempty_exact_string(row.message_id)
+        )
+
+    @classmethod
+    def _is_legal_reconciliation(cls, row: ResultRow) -> bool:
+        return (
+            cls._is_pending_base(row)
+            and 0 < row.attempts <= RUN_SETTINGS.max_attempts
+            and cls._nonempty_exact_string(row.request_id)
+            and type(row.message_id) is str
+            and (row.message_id == "" or bool(row.message_id.strip()))
+        )
 
     @staticmethod
     def _state(row: ResultRow) -> dict:
@@ -107,7 +151,7 @@ class RecipientPipeline:
         )
         while current.attempts < RUN_SETTINGS.max_attempts:
             if retry_not_before is not None:
-                self.coordinator.wait_until(retry_not_before)
+                self._wait_for_retry(retry_not_before)
             self.coordinator.before_api_call()
             attempt_row = replace(
                 current,
@@ -189,6 +233,13 @@ class RecipientPipeline:
             current = outcome.row
             retry_not_before = outcome.retry_not_before
         return PipelineResult(current)
+
+    def _wait_for_retry(self, deadline: float) -> None:
+        self.coordinator.raise_if_stopped()
+        remaining = deadline - self.coordinator.clock.monotonic()
+        if remaining > 0:
+            self.coordinator.clock.sleep(remaining)
+        self.coordinator.raise_if_stopped()
 
     @staticmethod
     def _is_exact_acceptance(response) -> bool:

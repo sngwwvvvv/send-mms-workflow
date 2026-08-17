@@ -4,6 +4,7 @@ from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
+import threading
 import unittest
 
 from sens_mms.api import (
@@ -41,6 +42,31 @@ class ManualClock:
     def sleep(self, seconds):
         self.sleeps.append(seconds)
         self.value += seconds
+
+
+class BlockingRetryClock(ManualClock):
+    def __init__(self):
+        super().__init__()
+        self.retry_sleep_started = threading.Event()
+        self.release_retry = threading.Event()
+        self._lock = threading.Lock()
+
+    def monotonic(self):
+        with self._lock:
+            return self.value
+
+    def sleep(self, seconds):
+        if (
+            threading.current_thread().name == "retry-worker"
+            and seconds == 10
+            and not self.retry_sleep_started.is_set()
+        ):
+            self.retry_sleep_started.set()
+            if not self.release_retry.wait(2):
+                raise AssertionError("retry worker was not released")
+        with self._lock:
+            self.sleeps.append((threading.current_thread().name, seconds))
+            self.value += seconds
 
 
 class RecordingEventLog:
@@ -82,6 +108,32 @@ class FailingStore(ResultStore):
         if self.replace_count == self.fail_replace:
             raise OSError("checkpoint unavailable")
         return super().replace_rows_atomic(expected, replacements)
+
+
+class NotifyingCoordinator(RunCoordinator):
+    def __init__(self, store, event_log, clock):
+        super().__init__(store, event_log, clock)
+        self.unrelated_gate_entered = threading.Event()
+
+    def before_api_call(self):
+        if threading.current_thread().name == "unrelated-worker":
+            self.unrelated_gate_entered.set()
+        return super().before_api_call()
+
+
+class SharedFailureApi:
+    def __init__(self, clock):
+        self.clock = clock
+        self.calls = []
+        self._lock = threading.Lock()
+        self.unrelated_called = threading.Event()
+
+    def send_one(self, to, file_ids, *, content_type):
+        with self._lock:
+            self.calls.append((to, self.clock.monotonic()))
+        if threading.current_thread().name == "unrelated-worker":
+            self.unrelated_called.set()
+        raise ExplicitApiFailure("400", "fixed fake failure", http_status=400)
 
 
 class ScriptedPipelineApi:
@@ -518,6 +570,142 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(result.row.delivery_status, "SENT")
         self.assertEqual(clock.sleeps, [10])
         self.assertEqual([call[0] for call in api.calls], ["send", "list", "get"])
+
+    def test_invalid_action_state_combinations_never_post_or_change_the_row(self):
+        """Catches terminal or ineligible rows being rewritten and posted."""
+        sent = replace(
+            reservation(attempts=1, request_id="request-1", message_id="message-1"),
+            delivery_status="SENT",
+            is_sent="true",
+        )
+        failed = replace(
+            reservation(attempts=1, request_id="request-1", message_id="message-1"),
+            delivery_status="FAILED",
+            is_sent="false",
+            error={"status": "400", "message": "redacted"},
+        )
+        correlated = reservation(
+            attempts=1,
+            request_id="request-1",
+            message_id="message-1",
+        )
+        cases = (
+            ("sent", sent, work("START_FRESH", True)),
+            ("failed", failed, work("RESUME_RESERVATION", True)),
+            ("attempt-zero-retry", reservation(), work("RETRY_EXPLICIT", True)),
+            ("positive-start", correlated, work("START_FRESH", True)),
+            ("positive-resume", correlated, work("RESUME_RESERVATION", True)),
+        )
+        for label, row, approved in cases:
+            with self.subTest(case=label):
+                api = ScriptedPipelineApi(
+                    sends=(
+                        ExplicitApiFailure("400", "must not run", http_status=400),
+                    )
+                )
+                pipeline, _, _, _ = self.make_pipeline(api, row)
+                result = pipeline.run(row, approved, ("file-1", "file-2"))
+                self.assertEqual(result, PipelineResult(row))
+                self.assertEqual(api.calls, [])
+                self.assertEqual(self.persisted(), row)
+
+    def test_recipient_retry_wait_does_not_gate_an_unrelated_worker(self):
+        """Catches a local retry deadline being published as a run-global gate."""
+        retry_row = reservation(
+            attempts=2,
+            request_id="request-1",
+            message_id="message-1",
+        )
+        other_id = "23456789ABCDEFGJ"
+        unrelated_row = replace(
+            reservation(),
+            receiving_number=OTHER,
+            delivery_id=other_id,
+        )
+        base = ResultStore(self.path)
+        base.rows = {
+            retry_row.receiving_number: retry_row,
+            unrelated_row.receiving_number: unrelated_row,
+        }
+        base.write_atomic()
+        clock = BlockingRetryClock()
+        coordinator = NotifyingCoordinator(
+            ResultStore(self.path),
+            RecordingEventLog(),
+            clock,
+        )
+        api = SharedFailureApi(clock)
+        pipeline = RecipientPipeline(api, coordinator, content_type="COMM")
+        errors = []
+
+        def run_retry():
+            try:
+                pipeline.run(
+                    retry_row,
+                    work("RETRY_EXPLICIT", True),
+                    ("file-1", "file-2"),
+                )
+            except BaseException as exc:
+                errors.append(exc)
+
+        def run_unrelated():
+            try:
+                pipeline.run(
+                    unrelated_row,
+                    ApprovedWork(OTHER, "RESUME_RESERVATION", False, other_id),
+                    ("file-1", "file-2"),
+                )
+            except BaseException as exc:
+                errors.append(exc)
+
+        retry_thread = threading.Thread(target=run_retry, name="retry-worker")
+        unrelated_thread = threading.Thread(
+            target=run_unrelated,
+            name="unrelated-worker",
+        )
+        retry_thread.start()
+        self.assertTrue(clock.retry_sleep_started.wait(1))
+        unrelated_thread.start()
+        self.assertTrue(coordinator.unrelated_gate_entered.wait(1))
+        try:
+            self.assertTrue(
+                api.unrelated_called.wait(1),
+                "unrelated POST was blocked by another recipient's retry delay",
+            )
+        finally:
+            clock.release_retry.set()
+            retry_thread.join(2)
+            unrelated_thread.join(2)
+        self.assertFalse(retry_thread.is_alive())
+        self.assertFalse(unrelated_thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(
+            [called_at for number, called_at in api.calls if number == OTHER],
+            [0.0],
+        )
+
+    def test_retry_and_longer_rate_gate_end_at_later_deadline_not_sum(self):
+        """Catches a ten-second retry being added after a twenty-second rate gate."""
+        row = reservation(
+            attempts=2,
+            request_id="request-1",
+            message_id="message-1",
+        )
+        api = ScriptedPipelineApi(
+            sends=(ExplicitApiFailure("400", "fixed", http_status=400),),
+        )
+        pipeline, clock, _, coordinator = self.make_pipeline(api, row)
+        coordinator.record_429()
+        coordinator.record_429()
+        result = pipeline.run(
+            row,
+            work("RETRY_EXPLICIT", True),
+            ("file-1", "file-2"),
+        )
+
+        self.assertEqual(result.row.attempts, 3)
+        self.assertEqual(clock.monotonic(), 20)
+        self.assertEqual([call[0] for call in api.calls], ["send"])
 
     def test_ambiguous_match_checkpoints_request_before_message_id(self):
         """Catches ambiguous recovery losing the request ID if message persistence fails."""
