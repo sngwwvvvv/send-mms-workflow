@@ -1,6 +1,7 @@
 import json
 import tempfile
 import threading
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -60,6 +61,45 @@ class LockedManualClock(Clock):
         with self._lock:
             self.sleeps.append(seconds)
             self.elapsed += seconds
+
+
+class BlockingManualClock(Clock):
+    def __init__(self):
+        self._condition = threading.Condition()
+        self.elapsed = 0.0
+        self.base = datetime(2026, 8, 17, 9, 0, 0, tzinfo=timezone.utc)
+        self.sleeps = []
+
+    def monotonic(self) -> float:
+        with self._condition:
+            return self.elapsed
+
+    def now(self) -> datetime:
+        with self._condition:
+            return self.base + timedelta(seconds=self.elapsed)
+
+    def sleep(self, seconds: float) -> None:
+        with self._condition:
+            target = self.elapsed + seconds
+            self.sleeps.append(seconds)
+            self._condition.notify_all()
+            while self.elapsed < target:
+                self._condition.wait()
+
+    def advance(self, seconds: float) -> None:
+        with self._condition:
+            self.elapsed += seconds
+            self._condition.notify_all()
+
+    def wait_for_sleep_count(self, count: int, timeout: float = 1.0) -> bool:
+        deadline = time.monotonic() + timeout
+        with self._condition:
+            while len(self.sleeps) < count:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._condition.wait(remaining)
+            return True
 
 
 class FailingWriteStore(ResultStore):
@@ -129,6 +169,25 @@ class CoordinationTests(unittest.TestCase):
             )
 
         self.assertEqual(ResultStore(store.path).load()[FIRST].delivery_id, ID_1)
+
+    def test_stale_expected_row_mismatch_does_not_stop_coordinator(self):
+        coordinator = self.make_coordinator()
+        coordinator.commit(reservation(FIRST, ID_1))
+
+        with self.assertRaises(ResultFormatError):
+            coordinator.commit_batch(
+                {FIRST: reservation(FIRST, ID_3)},
+                (reservation(FIRST, ID_4),),
+            )
+
+        coordinator.raise_if_stopped()
+        coordinator.commit(reservation(SECOND, ID_2))
+        coordinator.write("DELIVERY_ID_ASSIGNED", delivery_id=ID_2)
+        coordinator.before_api_call()
+
+        rows = ResultStore(coordinator.store.path).load()
+        self.assertEqual(rows[FIRST].delivery_id, ID_1)
+        self.assertEqual(rows[SECOND].delivery_id, ID_2)
 
     def test_five_concurrent_commits_and_events_keep_all_rows_and_exact_sequences(self):
         clock = LockedManualClock()
@@ -225,6 +284,41 @@ class CoordinationTests(unittest.TestCase):
         coordinator.before_api_call()
 
         self.assertEqual(clock.sleeps, [20])
+
+    def test_wait_until_publishes_later_deadline_to_shared_rate_limit_gate(self):
+        clock = BlockingManualClock()
+        coordinator = self.make_coordinator(clock=clock)
+        errors = []
+
+        coordinator.record_429()
+
+        def wait_worker() -> None:
+            try:
+                coordinator.wait_until(20)
+            except Exception as exc:  # pragma: no cover - asserted through errors
+                errors.append(exc)
+
+        def api_worker() -> None:
+            try:
+                coordinator.before_api_call()
+            except Exception as exc:  # pragma: no cover - asserted through errors
+                errors.append(exc)
+
+        wait_thread = threading.Thread(target=wait_worker)
+        api_thread = threading.Thread(target=api_worker)
+
+        wait_thread.start()
+        self.assertTrue(clock.wait_for_sleep_count(1))
+
+        api_thread.start()
+        self.assertFalse(clock.wait_for_sleep_count(2, timeout=0.2))
+        self.assertEqual(clock.sleeps, [20])
+
+        clock.advance(20)
+        wait_thread.join()
+        api_thread.join()
+
+        self.assertEqual(errors, [])
 
     def test_checkpoint_failure_stops_later_commits_events_and_api_calls(self):
         failure = OSError("checkpoint unavailable")

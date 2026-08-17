@@ -5,7 +5,7 @@ from datetime import datetime
 import threading
 from typing import Mapping, Protocol, Sequence
 
-from .results import ResultRow, ResultStore
+from .results import ResultFormatError, ResultRow, ResultStore
 
 
 class Clock(Protocol):
@@ -29,6 +29,9 @@ RUN_SETTINGS = RunSettings(5, 1, 120, 10, 3, (10, 20))
 
 class RunSafetyError(RuntimeError):
     pass
+
+
+_STALE_CHECKPOINT_MISMATCH = "result row does not match expected checkpoint"
 
 
 class RunCoordinator:
@@ -69,6 +72,11 @@ class RunCoordinator:
             try:
                 self.store.load()
                 self.store.replace_rows_atomic(expected, replacements)
+            except ResultFormatError as exc:
+                if exc.args == (_STALE_CHECKPOINT_MISMATCH,):
+                    raise
+                self.stop()
+                raise
             except Exception:
                 self.stop()
                 raise
@@ -109,7 +117,7 @@ class RunCoordinator:
 
     def wait_until(self, deadline: float) -> None:
         self.raise_if_stopped()
-        remaining = deadline - self.clock.monotonic()
-        if remaining > 0:
-            self.clock.sleep(remaining)
-        self.raise_if_stopped()
+        with self._rate_lock:
+            self.raise_if_stopped()
+            self._blocked_until = max(self._blocked_until, deadline)
+        self.before_api_call()
