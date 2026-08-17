@@ -12,6 +12,7 @@ import re
 import secrets
 import tempfile
 import threading
+from typing import Mapping, Sequence
 from zoneinfo import ZoneInfo
 
 
@@ -262,6 +263,7 @@ class ResultStore:
 
     def load(self) -> dict[str, ResultRow]:
         if not self.path.exists():
+            self.rows = {}
             return self.rows
         try:
             with self.path.open(encoding="utf-8-sig", newline="") as file:
@@ -299,6 +301,33 @@ class ResultStore:
     def upsert(self, row: ResultRow) -> None:
         row.validate()
         self.rows[row.receiving_number] = row
+
+    def replace_rows_atomic(
+        self,
+        expected: Mapping[str, ResultRow | None],
+        replacements: Sequence[ResultRow],
+    ) -> None:
+        for number, expected_row in expected.items():
+            if self.rows.get(number) != expected_row:
+                raise ResultFormatError("result row does not match expected checkpoint")
+
+        validated = []
+        seen_numbers = set()
+        for row in replacements:
+            row.validate()
+            if row.receiving_number in seen_numbers:
+                raise ResultFormatError("duplicate replacement row")
+            seen_numbers.add(row.receiving_number)
+            validated.append(row)
+
+        original_rows = dict(self.rows)
+        try:
+            for row in validated:
+                self.rows[row.receiving_number] = row
+            self.write_atomic()
+        except Exception:
+            self.rows = original_rows
+            raise
 
     def write_atomic(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)

@@ -258,6 +258,54 @@ def _sanitize_summary(value):
     return dict(value)
 
 
+def _serialize_event_line(
+    *,
+    now,
+    sequence,
+    event,
+    delivery_id=None,
+    attempt=None,
+    api=None,
+    http_status=None,
+    request_id=None,
+    message_id=None,
+    response=None,
+    error=None,
+    state=None,
+    summary=None,
+    completed_at=None,
+    result_snapshot=None,
+):
+    response = _sanitize_response(response) if response is not None else None
+    error = _sanitize_error(error) if error is not None else None
+    state = _sanitize_state(state) if state is not None else None
+    summary = _sanitize_summary(summary) if summary is not None else None
+    request_id = _sanitize_correlation_id(request_id, allow_none=True)
+    message_id = _sanitize_correlation_id(message_id, allow_none=True)
+    row = {
+        "schema_version": 1,
+        "sequence": sequence,
+        "logged_at": _seoul_time(now).isoformat(timespec="milliseconds"),
+        "event": event,
+        "delivery_id": delivery_id,
+        "attempt": attempt,
+        "api": api,
+        "http_status": http_status,
+        "request_id": request_id,
+        "message_id": message_id,
+        "response": response,
+        "error": error,
+        "state": state,
+        "summary": summary,
+        "completed_at": completed_at,
+        "result_snapshot": result_snapshot,
+    }
+    try:
+        return json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n"
+    except (TypeError, ValueError) as exc:
+        raise EventLogError("event log data invalid") from exc
+
+
 class JsonlEventLog:
     def __init__(self, path: Path, *, now):
         self.path = Path(path)
@@ -290,38 +338,27 @@ class JsonlEventLog:
     ) -> None:
         if self._poisoned:
             raise EventLogError("event log unavailable")
+        sequence = self._sequence + 1
         try:
-            response = _sanitize_response(response) if response is not None else None
-            error = _sanitize_error(error) if error is not None else None
-            state = _sanitize_state(state) if state is not None else None
-            summary = _sanitize_summary(summary) if summary is not None else None
-            request_id = _sanitize_correlation_id(request_id, allow_none=True)
-            message_id = _sanitize_correlation_id(message_id, allow_none=True)
+            encoded = _serialize_event_line(
+                now=self._now(),
+                sequence=sequence,
+                event=event,
+                delivery_id=delivery_id,
+                attempt=attempt,
+                api=api,
+                http_status=http_status,
+                request_id=request_id,
+                message_id=message_id,
+                response=response,
+                error=error,
+                state=state,
+                summary=summary,
+                completed_at=completed_at,
+                result_snapshot=result_snapshot,
+            )
         except EventLogError:
             raise
-        sequence = self._sequence + 1
-        row = {
-            "schema_version": 1,
-            "sequence": sequence,
-            "logged_at": _seoul_time(self._now()).isoformat(timespec="milliseconds"),
-            "event": event,
-            "delivery_id": delivery_id,
-            "attempt": attempt,
-            "api": api,
-            "http_status": http_status,
-            "request_id": request_id,
-            "message_id": message_id,
-            "response": response,
-            "error": error,
-            "state": state,
-            "summary": summary,
-            "completed_at": completed_at,
-            "result_snapshot": result_snapshot,
-        }
-        try:
-            encoded = json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n"
-        except (TypeError, ValueError) as exc:
-            raise EventLogError("event log data invalid") from exc
         try:
             self._handle.write(encoded)
             self._handle.flush()

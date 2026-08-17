@@ -30,6 +30,88 @@ CHANGED_LEGACY_BYTES = (
 
 
 class ResultTests(unittest.TestCase):
+    def test_replace_rows_atomic_updates_multiple_rows_in_one_write(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = ResultStore(Path(directory) / "result.csv")
+            store.upsert(ResultRow(
+                receiving_number="0101",
+                delivery_id=VALID_ID,
+                delivery_status="PENDING_CONFIRMATION",
+                is_sent="",
+                attempts=0,
+            ))
+            store.write_atomic()
+            fresh = ResultStore(store.path)
+            original_bytes = store.path.read_bytes()
+
+            fresh.load()
+            fresh.replace_rows_atomic(
+                {"0101": ResultRow(
+                    receiving_number="0101",
+                    delivery_id=VALID_ID,
+                    delivery_status="PENDING_CONFIRMATION",
+                    is_sent="",
+                    attempts=0,
+                )},
+                (
+                    ResultRow(
+                        receiving_number="0101",
+                        delivery_id=VALID_ID,
+                        delivery_status="SENT",
+                        is_sent="true",
+                        attempts=1,
+                    ),
+                    ResultRow(
+                        receiving_number="0102",
+                        delivery_id="23456789ABCDEFGJ",
+                        delivery_status="PENDING_CONFIRMATION",
+                        is_sent="",
+                        attempts=0,
+                    ),
+                ),
+            )
+
+            loaded = ResultStore(store.path).load()
+            self.assertEqual(set(loaded), {"0101", "0102"})
+            self.assertEqual(loaded["0101"].delivery_status, "SENT")
+            self.assertNotEqual(store.path.read_bytes(), original_bytes)
+
+    def test_replace_rows_atomic_rejects_stale_expected_rows_without_partial_write(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = ResultStore(Path(directory) / "result.csv")
+            current = ResultRow(
+                receiving_number="0101",
+                delivery_id=VALID_ID,
+                delivery_status="PENDING_CONFIRMATION",
+                is_sent="",
+                attempts=0,
+            )
+            store.upsert(current)
+            store.write_atomic()
+            original_bytes = store.path.read_bytes()
+            fresh = ResultStore(store.path)
+            fresh.load()
+
+            with self.assertRaises(ResultFormatError):
+                fresh.replace_rows_atomic(
+                    {"0101": ResultRow(
+                        receiving_number="0101",
+                        delivery_id="23456789ABCDEFGJ",
+                        delivery_status="PENDING_CONFIRMATION",
+                        is_sent="",
+                        attempts=0,
+                    )},
+                    (reservation := ResultRow(
+                        receiving_number="0101",
+                        delivery_id="23456789ABCDEFGK",
+                        delivery_status="PENDING_CONFIRMATION",
+                        is_sent="",
+                        attempts=0,
+                    ),),
+                )
+
+            self.assertEqual(store.path.read_bytes(), original_bytes)
+
     def test_snapshot_attaches_seoul_to_naive_time_without_host_conversion(self):
         """Catches standalone ResultStore snapshots interpreting naive time as host-local."""
         class HostSensitiveNaive(datetime):

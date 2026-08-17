@@ -53,6 +53,40 @@ def serialized_message():
 
 
 class EventLogTests(unittest.TestCase):
+    def test_private_serializer_builds_the_exact_jsonl_row_before_write(self):
+        serializer = getattr(event_log, "_serialize_event_line", None)
+        self.assertTrue(callable(serializer), "_serialize_event_line must exist")
+
+        encoded = serializer(
+            now=datetime(2026, 8, 14, 3, 4, 5, 678901, tzinfo=timezone.utc),
+            sequence=3,
+            event="RESULT_SNAPSHOT_WRITTEN",
+            result_snapshot="C:/results/result_20260814_120405.csv",
+            completed_at="2026-08-14T12:04:05.678+09:00",
+        )
+
+        self.assertEqual(
+            json.loads(encoded),
+            {
+                "schema_version": 1,
+                "sequence": 3,
+                "logged_at": "2026-08-14T12:04:05.678+09:00",
+                "event": "RESULT_SNAPSHOT_WRITTEN",
+                "delivery_id": None,
+                "attempt": None,
+                "api": None,
+                "http_status": None,
+                "request_id": None,
+                "message_id": None,
+                "response": None,
+                "error": None,
+                "state": None,
+                "summary": None,
+                "completed_at": "2026-08-14T12:04:05.678+09:00",
+                "result_snapshot": "C:/results/result_20260814_120405.csv",
+            },
+        )
+
     def test_total_sanitizers_never_invoke_hostile_values_across_jsonl_boundaries(self):
         """Catches response/error/state sanitizers invoking or rejecting hostile values."""
         calls = []
