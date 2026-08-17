@@ -26,6 +26,7 @@ from sens_mms.config import Config
 from sens_mms.coordination import RUN_SETTINGS, RunCoordinator
 from sens_mms.event_log import EventLogError, JsonlEventLog
 from sens_mms.inputs import MESSAGE_BODY
+from sens_mms.preflight import canonical_result_state
 from sens_mms.results import ResultFormatError, ResultRow, ResultStore
 from sens_mms.workflow import Workflow
 
@@ -662,6 +663,36 @@ class JoinTrackingWorkflow(Workflow):
                 self.joined_workers += 1
 
 
+class InterruptProbeWorkflow(Workflow):
+    """Holds the first worker wave until executor cleanup can be observed."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.first_wave = threading.Barrier(RUN_SETTINGS.worker_count + 1)
+        self.release_workers = threading.Event()
+        self._probe_lock = threading.Lock()
+        self.started_workers = 0
+        self.joined_workers = 0
+        self.late_api_calls = 0
+
+    def _run_one(self, row, work, file_ids):
+        with self._probe_lock:
+            self.started_workers += 1
+            ordinal = self.started_workers
+        if ordinal <= RUN_SETTINGS.worker_count:
+            self.first_wave.wait()
+        self.release_workers.wait()
+        try:
+            if not self.coordinator._stopped.is_set():
+                with self._probe_lock:
+                    self.late_api_calls += 1
+            self.coordinator.raise_if_stopped()
+            return SimpleNamespace(row=row)
+        finally:
+            with self._probe_lock:
+                self.joined_workers += 1
+
+
 class WorkerGateCoordinator(RunCoordinator):
     barrier = None
     main_thread = None
@@ -824,6 +855,115 @@ class WorkflowTests(unittest.TestCase):
             json.dumps(lookup_fields, ensure_ascii=False),
         )
 
+    def test_submission_interrupt_stops_cancels_queue_and_joins_running_workers(self):
+        """Catches executor submission interruption leaking queued API work."""
+        root = make_root()
+        workflow = InterruptProbeWorkflow(
+            root,
+            config(),
+            ResultStore.for_root(root),
+            OrchestrationApi(),
+            ThreadSafeClock(),
+            RecordingEventLog(root),
+            FixedIdFactory(),
+        )
+        interruption = KeyboardInterrupt("submission interrupted")
+        executors = []
+
+        class SubmitInterruptExecutor(workflow_module.ThreadPoolExecutor):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.submitted = []
+                self.submit_count = 0
+                self.stop_seen_before_shutdown = None
+                self.queue_cancelled_before_shutdown = None
+                executors.append(self)
+
+            def submit(self, *args, **kwargs):
+                self.submit_count += 1
+                if self.submit_count == 7:
+                    workflow.first_wave.wait()
+                    raise interruption
+                future = super().submit(*args, **kwargs)
+                self.submitted.append(future)
+                return future
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                self.stop_seen_before_shutdown = workflow.coordinator._stopped.is_set()
+                self.queue_cancelled_before_shutdown = self.submitted[5].cancelled()
+                workflow.release_workers.set()
+                return super().__exit__(exc_type, exc_value, traceback)
+
+        jobs = tuple((object(), object()) for _ in range(7))
+        with patch("sens_mms.workflow.ThreadPoolExecutor", SubmitInterruptExecutor):
+            with self.assertRaises(KeyboardInterrupt) as raised:
+                workflow._run_phase(jobs)
+
+        executor = executors[0]
+        self.assertIs(raised.exception, interruption)
+        self.assertTrue(executor.stop_seen_before_shutdown)
+        self.assertTrue(executor.queue_cancelled_before_shutdown)
+        self.assertEqual(workflow.started_workers, RUN_SETTINGS.worker_count)
+        self.assertEqual(workflow.joined_workers, RUN_SETTINGS.worker_count)
+        self.assertEqual(workflow.late_api_calls, 0)
+
+    def test_result_collection_interrupt_stops_cancels_queue_and_joins_running_workers(self):
+        """Catches as_completed interruption leaking queued API work."""
+        root = make_root()
+        workflow = InterruptProbeWorkflow(
+            root,
+            config(),
+            ResultStore.for_root(root),
+            OrchestrationApi(),
+            ThreadSafeClock(),
+            RecordingEventLog(root),
+            FixedIdFactory(),
+        )
+        interruption = KeyboardInterrupt("collection interrupted")
+        executors = []
+
+        class CollectionInterruptExecutor(workflow_module.ThreadPoolExecutor):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.submitted = []
+                self.stop_seen_before_shutdown = None
+                self.queue_cancelled_before_shutdown = None
+                executors.append(self)
+
+            def submit(self, *args, **kwargs):
+                future = super().submit(*args, **kwargs)
+                self.submitted.append(future)
+                return future
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                self.stop_seen_before_shutdown = workflow.coordinator._stopped.is_set()
+                self.queue_cancelled_before_shutdown = all(
+                    future.cancelled() for future in self.submitted[5:]
+                )
+                workflow.release_workers.set()
+                return super().__exit__(exc_type, exc_value, traceback)
+
+        def interrupted_completion(futures):
+            workflow.first_wave.wait()
+            raise interruption
+            yield from ()  # pragma: no cover - keeps this a generator
+
+        jobs = tuple((object(), object()) for _ in range(7))
+        with (
+            patch("sens_mms.workflow.ThreadPoolExecutor", CollectionInterruptExecutor),
+            patch("sens_mms.workflow.as_completed", interrupted_completion),
+        ):
+            with self.assertRaises(KeyboardInterrupt) as raised:
+                workflow._run_phase(jobs)
+
+        executor = executors[0]
+        self.assertIs(raised.exception, interruption)
+        self.assertTrue(executor.stop_seen_before_shutdown)
+        self.assertTrue(executor.queue_cancelled_before_shutdown)
+        self.assertEqual(workflow.started_workers, RUN_SETTINGS.worker_count)
+        self.assertEqual(workflow.joined_workers, RUN_SETTINGS.worker_count)
+        self.assertEqual(workflow.late_api_calls, 0)
+
     def test_all_pending_futures_join_before_upload_and_new_post(self):
         """Catches phase two starting while a pending reconciliation still runs."""
         pending_number = "01000000001"
@@ -856,6 +996,51 @@ class WorkflowTests(unittest.TestCase):
             api.index("upload:1"),
         )
         self.assertLess(api.index("upload:2"), api.index(f"{new_number}:send"))
+
+    def test_absent_pending_reconciles_before_new_input_and_cannot_auto_retry(self):
+        """Catches CSV membership dropping durable reconciliation or authorizing resend."""
+        absent_number = "01000000021"
+        new_number = "01000000022"
+        for outcome, expected_status in (("success", "SENT"), ("fail", "PENDING_CONFIRMATION")):
+            with self.subTest(outcome=outcome):
+                root = make_root((new_number,))
+                pending = pending_result(
+                    absent_number,
+                    "KKKKKKKKKKKKKKK2",
+                )
+                store = ResultStore.for_root(root)
+                store.upsert(pending)
+                store.write_atomic()
+                api = OrchestrationApi(
+                    pending=((pending, (outcome,)),),
+                    send_outcomes={new_number: ("success",)},
+                )
+                workflow = make_workflow(
+                    root,
+                    store,
+                    api,
+                    clock=ThreadSafeClock(),
+                    delivery_id_factory=FixedIdFactory("KKKKKKKKKKKKKKK3"),
+                )
+
+                summary = workflow.run_live(workflow.current_token())
+
+                rows = ResultStore.for_root(root).load()
+                self.assertEqual(rows[absent_number].delivery_status, expected_status)
+                self.assertEqual(rows[new_number].delivery_status, "SENT")
+                self.assertEqual(summary.total, 2)
+                self.assertEqual(
+                    [number for number, _, _ in api.sent],
+                    [new_number],
+                )
+                self.assertLess(
+                    api.index(f"{absent_number}:get:done"),
+                    api.index("upload:1"),
+                )
+                self.assertLess(
+                    api.index("upload:2"),
+                    api.index(f"{new_number}:send"),
+                )
 
     def test_pending_only_terminal_pending_and_ambiguous_work_upload_nothing(self):
         """Catches unconditional image upload when no approved POST remains."""
@@ -924,6 +1109,42 @@ class WorkflowTests(unittest.TestCase):
                 self.assertEqual(len(api.uploaded), expected_uploads)
                 self.assertEqual(len(api.sent), expected_sends)
                 self.assertEqual(clock.sleeps.count(RUN_SETTINGS.retry_delay_seconds), expected_sends)
+
+    def test_reconciled_retry_keeps_original_deadline_across_seven_second_upload(self):
+        """Catches upload time being followed by a fresh ten-second retry delay."""
+        number = "01000000023"
+        root = make_root((number,))
+        row = pending_result(
+            number,
+            "LLLLLLLLLLLLLLL2",
+            attempts=1,
+        )
+        store = ResultStore.for_root(root)
+        store.upsert(row)
+        store.write_atomic()
+        clock = ThreadSafeClock()
+
+        def spend_upload_time(_upload_number):
+            clock.sleep(3.5)
+
+        api = OrchestrationApi(
+            pending=((row, ("fail",)),),
+            send_outcomes={number: ("success",)},
+            on_upload=spend_upload_time,
+        )
+        workflow = make_workflow(
+            root,
+            store,
+            api,
+            clock=clock,
+            delivery_id_factory=FixedIdFactory(),
+        )
+
+        summary = workflow.run_live(workflow.current_token())
+
+        self.assertEqual(summary.sent, 1)
+        self.assertEqual(clock.sleeps, [3.5, 3.5, 3.0])
+        self.assertEqual(clock.monotonic(), 10)
 
     def test_retry_rejects_any_reconciled_row_change_during_upload(self):
         """Catches a retry silently adopting a changed durable row after approval."""
@@ -1600,10 +1821,32 @@ class WorkflowTests(unittest.TestCase):
             [event for event, _ in log.events],
             ["WORKFLOW_STARTED", "WORKFLOW_ABORTED"],
         )
+        self.assertTrue(workflow.coordinator._stopped.is_set())
 
     def test_abort_log_failure_does_not_replace_post_started_primary_exception(self):
         root = make_root()
         abort_failure = EventLogError("secondary abort failure")
+        log = FailingEventLog(root, {"WORKFLOW_ABORTED": [abort_failure]})
+        workflow = make_workflow(
+            root,
+            ResultStore.for_root(root),
+            ScriptedApi(sends=[], lists=[], gets=[]),
+            event_log=log,
+        )
+
+        with self.assertRaises(workflow_module.ApprovalTokenMismatch) as raised:
+            workflow.run_live("wrong-token")
+
+        self.assertEqual(str(raised.exception), "approval token mismatch")
+        self.assertEqual(
+            log.write_attempts,
+            ["WORKFLOW_STARTED", "WORKFLOW_ABORTED"],
+        )
+
+    def test_abort_base_exception_does_not_replace_post_started_primary_exception(self):
+        """Catches best-effort abort logging replacing the original BaseException path."""
+        root = make_root()
+        abort_failure = KeyboardInterrupt("secondary abort interruption")
         log = FailingEventLog(root, {"WORKFLOW_ABORTED": [abort_failure]})
         workflow = make_workflow(
             root,
@@ -1746,9 +1989,11 @@ class WorkflowTests(unittest.TestCase):
                 work_items=(),
                 content_type="COMM",
                 approved_images=(),
+                approved_result_state=canonical_result_state(()),
             )
 
         store = ResultStore.for_root(root)
+        store.write_atomic()
         workflow = make_workflow(
             root,
             store,
@@ -1762,6 +2007,116 @@ class WorkflowTests(unittest.TestCase):
 
         self.assertEqual(token, "resend-token")
         self.assertEqual(observed_modes, [True, True])
+
+    def test_resend_archive_precedes_upload_and_survives_abort_after_reservation(self):
+        """Catches resend mutation without an exact immutable pre-resend checkpoint."""
+        root = make_root()
+        store = seed_resend_rows(
+            root,
+            (failed_result(RECIPIENT, DELIVERY_ID_1, "request-1", "message-1"),),
+        )
+        checkpoint_bytes = store.path.read_bytes()
+        snapshots_before = set((root / "results").glob("result_*.csv"))
+        failure = EventLogError("reservation event unavailable")
+        log = FailingEventLog(root, {"DELIVERY_ID_ASSIGNED": [failure]})
+        archive_seen_at_upload = []
+
+        def observe_archive(_upload_number):
+            archive_seen_at_upload.append(
+                any(event == "RESEND_ARCHIVE_WRITTEN" for event, _ in log.events)
+            )
+
+        api = OrchestrationApi(on_upload=observe_archive)
+        workflow = make_workflow(
+            root,
+            store,
+            api,
+            clock=ThreadSafeClock(),
+            event_log=log,
+            delivery_id_factory=FixedIdFactory(DELIVERY_ID_2),
+            resend_failed=True,
+        )
+
+        with self.assertRaises(EventLogError) as raised:
+            workflow.run_live(workflow.current_token())
+
+        snapshots_after = set((root / "results").glob("result_*.csv"))
+        archives = snapshots_after - snapshots_before
+        self.assertIs(raised.exception, failure)
+        self.assertEqual(len(archives), 1)
+        self.assertEqual(next(iter(archives)).read_bytes(), checkpoint_bytes)
+        self.assertEqual(archive_seen_at_upload, [True, True])
+        self.assertEqual(api.sent, [])
+        self.assertEqual(
+            next(
+                fields
+                for event, fields in log.events
+                if event == "RESEND_ARCHIVE_WRITTEN"
+            ),
+            {},
+        )
+        current = ResultStore.for_root(root).load()[RECIPIENT]
+        self.assertEqual(
+            (current.delivery_id, current.delivery_status, current.attempts),
+            (DELIVERY_ID_2, "PENDING_CONFIRMATION", 0),
+        )
+
+    def test_resend_archive_or_archive_event_failure_closes_before_mutation_and_api(self):
+        """Catches either archive durability boundary being treated as best effort."""
+        archive_failure = OSError("archive unavailable")
+        event_failure = EventLogError("archive event unavailable")
+
+        class ArchiveFailingStore(ResultStore):
+            def archive_current(self, completed_at):
+                raise archive_failure
+
+        for failure_mode in ("archive", "event"):
+            with self.subTest(failure_mode=failure_mode):
+                root = make_root()
+                seeded = seed_resend_rows(
+                    root,
+                    (
+                        failed_result(
+                            RECIPIENT,
+                            DELIVERY_ID_1,
+                            "request-1",
+                            "message-1",
+                        ),
+                    ),
+                )
+                checkpoint_bytes = seeded.path.read_bytes()
+                store = (
+                    ArchiveFailingStore(seeded.path)
+                    if failure_mode == "archive"
+                    else ResultStore(seeded.path)
+                )
+                log = (
+                    RecordingEventLog(root)
+                    if failure_mode == "archive"
+                    else FailingEventLog(
+                        root,
+                        {"RESEND_ARCHIVE_WRITTEN": [event_failure]},
+                    )
+                )
+                api = OrchestrationApi()
+                workflow = make_workflow(
+                    root,
+                    store,
+                    api,
+                    clock=ThreadSafeClock(),
+                    event_log=log,
+                    delivery_id_factory=FixedIdFactory(DELIVERY_ID_2),
+                    resend_failed=True,
+                )
+
+                expected = archive_failure if failure_mode == "archive" else event_failure
+                with self.assertRaises(type(expected)) as raised:
+                    workflow.run_live(workflow.current_token())
+
+                self.assertIs(raised.exception, expected)
+                self.assertEqual(seeded.path.read_bytes(), checkpoint_bytes)
+                self.assertEqual((api.uploaded, api.sent), ([], []))
+                self.assertTrue(workflow.coordinator._stopped.is_set())
 
     def test_resend_second_preflight_blocks_started_log_mutation_of_exact_candidate(self):
         mutations = (
@@ -1821,6 +2176,8 @@ class WorkflowTests(unittest.TestCase):
             root,
             (failed_result(RECIPIENT, DELIVERY_ID_1, "request-1", "message-1"),),
         )
+        snapshots_before = set((root / "results").glob("result_*.csv"))
+        mutation_payload = []
         api = ScriptedApi(
             sends=[send_response()],
             lists=[list_response(message("PROCESSING"))],
@@ -1847,6 +2204,7 @@ class WorkflowTests(unittest.TestCase):
                 row = fresh.load()[RECIPIENT]
                 fresh.upsert(replace(row, attempts=2))
                 fresh.write_atomic()
+                mutation_payload.append(fresh.path.read_bytes())
             return report
 
         with patch(
@@ -1856,18 +2214,26 @@ class WorkflowTests(unittest.TestCase):
             token = workflow.current_token()
             with self.assertRaisesRegex(
                 ResultFormatError,
-                "^approved resend row does not match current checkpoint$",
+                "^approved result does not match current checkpoint$",
             ):
                 workflow.run_live(token)
 
         self.assertEqual(calls, 2)
+        snapshots_after = set((root / "results").glob("result_*.csv"))
+        archives = snapshots_after - snapshots_before
+        self.assertEqual(len(archives), 1)
+        self.assertEqual(next(iter(archives)).read_bytes(), mutation_payload[0])
         self.assertEqual(
             (api.uploaded, api.sent, api.listed_requests, api.got),
-            (["mms_01_intro.jpg", "mms_02_details.jpg"], [], [], []),
+            ([], [], [], []),
         )
         self.assertEqual(
             [event for event, _ in log.events],
-            ["WORKFLOW_STARTED", "WORKFLOW_ABORTED"],
+            [
+                "WORKFLOW_STARTED",
+                "RESEND_ARCHIVE_WRITTEN",
+                "WORKFLOW_ABORTED",
+            ],
         )
 
     def test_resend_factory_mutation_of_each_candidate_identity_field_blocks_without_publish_or_api(self):
@@ -1926,7 +2292,11 @@ class WorkflowTests(unittest.TestCase):
                 )
                 self.assertEqual(
                     [event for event, _ in log.events],
-                    ["WORKFLOW_STARTED", "WORKFLOW_ABORTED"],
+                    [
+                        "WORKFLOW_STARTED",
+                        "RESEND_ARCHIVE_WRITTEN",
+                        "WORKFLOW_ABORTED",
+                    ],
                 )
 
     def test_resend_factory_noncandidate_mutation_is_preserved_by_atomic_reservation_publish(self):

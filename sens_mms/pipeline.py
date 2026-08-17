@@ -143,12 +143,16 @@ class RecipientPipeline:
         file_ids: tuple[str, ...],
     ) -> PipelineResult:
         current = row
-        retry_not_before = (
-            self.coordinator.clock.monotonic()
-            + RUN_SETTINGS.retry_delay_seconds
-            if work.action == "RETRY_EXPLICIT"
-            else None
-        )
+        retry_not_before = None
+        if work.action == "RETRY_EXPLICIT":
+            retry_not_before = work.retry_not_before
+            if retry_not_before is None:
+                retry_not_before = (
+                    self.coordinator.clock.monotonic()
+                    + RUN_SETTINGS.retry_delay_seconds
+                )
+            elif type(retry_not_before) not in {int, float}:
+                raise ResultFormatError("approved retry deadline invalid")
         while current.attempts < RUN_SETTINGS.max_attempts:
             if retry_not_before is not None:
                 self._wait_for_retry(retry_not_before)
@@ -168,7 +172,7 @@ class RecipientPipeline:
                 delivery_id=current.delivery_id,
                 attempt=current.attempts,
             )
-            self.coordinator.raise_if_stopped()
+            self.coordinator.before_api_call()
             started_at = self._seoul_time(self.coordinator.clock.now())
             attempt_started = self.coordinator.clock.monotonic()
             try:

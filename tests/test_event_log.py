@@ -87,6 +87,38 @@ class EventLogTests(unittest.TestCase):
             },
         )
 
+    def test_resend_archive_event_is_path_free_and_deidentified(self):
+        """Catches the archive boundary leaking a path or correlation identifier."""
+        path = Path(tempfile.mkdtemp()) / "delivery.jsonl"
+        now = lambda: datetime(2026, 8, 14, 3, 4, 5, 678901, tzinfo=timezone.utc)
+
+        with JsonlEventLog(path, now=now) as log:
+            log.write("RESEND_ARCHIVE_WRITTEN")
+
+        row = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(row["event"], "RESEND_ARCHIVE_WRITTEN")
+        self.assertEqual(
+            {
+                key: value
+                for key, value in row.items()
+                if key not in {"schema_version", "sequence", "logged_at", "event"}
+            },
+            {
+                "delivery_id": None,
+                "attempt": None,
+                "api": None,
+                "http_status": None,
+                "request_id": None,
+                "message_id": None,
+                "response": None,
+                "error": None,
+                "state": None,
+                "summary": None,
+                "completed_at": None,
+                "result_snapshot": None,
+            },
+        )
+
     def test_total_sanitizers_never_invoke_hostile_values_across_jsonl_boundaries(self):
         """Catches response/error/state sanitizers invoking or rejecting hostile values."""
         calls = []

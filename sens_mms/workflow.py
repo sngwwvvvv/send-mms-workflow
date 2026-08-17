@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
@@ -12,7 +12,12 @@ from .coordination import RUN_SETTINGS, RunCoordinator, RunSafetyError
 from .event_log import safe_error_dict
 from .inputs import load_recipients
 from .pipeline import PipelineResult, RecipientPipeline
-from .preflight import ApprovedWork, PreflightReport, build_preflight
+from .preflight import (
+    ApprovedWork,
+    PreflightReport,
+    build_preflight,
+    canonical_result_state,
+)
 from .results import (
     LiveExecutionLock,
     ResultFormatError,
@@ -91,10 +96,11 @@ class Workflow:
                 started = True
                 return self._run_after_started(approval_token)
         except BaseException:
+            self.coordinator.stop()
             if started:
                 try:
                     self.event_log.write("WORKFLOW_ABORTED")
-                except Exception:
+                except BaseException:
                     pass
             raise
 
@@ -107,6 +113,9 @@ class Workflow:
         )
         if approval_token != report.approval_token:
             raise ApprovalTokenMismatch("approval token mismatch")
+
+        if self.resend_failed:
+            self._write_resend_archive(report)
 
         self._pipeline = RecipientPipeline(
             self.api,
@@ -150,6 +159,7 @@ class Workflow:
                                 action="RETRY_EXPLICIT",
                                 allow_retry_after_explicit_failure=True,
                                 source_delivery_id=result.row.delivery_id,
+                                retry_not_before=result.retry_not_before,
                             ),
                             reconciled_row=result.row,
                         )
@@ -203,27 +213,64 @@ class Workflow:
         results = []
         errors = []
         with ThreadPoolExecutor(max_workers=RUN_SETTINGS.worker_count) as pool:
-            futures = [
-                pool.submit(self._run_one, row, work, tuple(file_ids))
-                for row, work in jobs
-            ]
-            for future in as_completed(futures):
-                try:
-                    results.append(future.result())
-                except BaseException as exc:
-                    self.coordinator.stop()
-                    errors.append(exc)
+            futures = []
+            try:
+                for row, work in jobs:
+                    futures.append(
+                        pool.submit(self._run_one, row, work, tuple(file_ids))
+                    )
+                for future in as_completed(futures):
+                    try:
+                        results.append(future.result())
+                    except BaseException as exc:
+                        self._stop_and_cancel(futures)
+                        errors.append(exc)
+            except BaseException:
+                self._stop_and_cancel(futures)
+                raise
         if errors:
             primary = next(
                 (
                     error
                     for error in errors
-                    if not isinstance(error, RunSafetyError)
+                    if not isinstance(error, (RunSafetyError, CancelledError))
                 ),
-                errors[0],
+                next(
+                    (
+                        error
+                        for error in errors
+                        if not isinstance(error, CancelledError)
+                    ),
+                    errors[0],
+                ),
             )
             raise primary
         return tuple(results)
+
+    def _stop_and_cancel(self, futures) -> None:
+        self.coordinator.stop()
+        for future in futures:
+            try:
+                future.cancel()
+            except BaseException:
+                pass
+
+    def _write_resend_archive(self, report: PreflightReport) -> None:
+        self.coordinator.raise_if_stopped()
+        archived_at = self._seoul_time(self.clock.now())
+        try:
+            archive = self.store.archive_current(archived_at)
+            archived_rows = ResultStore(archive).load()
+        except BaseException:
+            self.coordinator.stop()
+            raise
+        self.coordinator.write("RESEND_ARCHIVE_WRITTEN")
+        if canonical_result_state(archived_rows.values()) != report.approved_result_state:
+            self.coordinator.stop()
+            raise ResultFormatError(
+                "approved result does not match current checkpoint"
+            )
+        self.store.rows = dict(archived_rows)
 
     def _run_one(
         self,

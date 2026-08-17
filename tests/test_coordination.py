@@ -102,6 +102,33 @@ class BlockingManualClock(Clock):
             return True
 
 
+class Overlapping429Clock(Clock):
+    """Injects a second observation while the first gate waiter is asleep."""
+
+    def __init__(self):
+        self.elapsed = 0.0
+        self.base = datetime(2026, 8, 17, 9, 0, 0, tzinfo=timezone.utc)
+        self.sleeps = []
+        self.coordinator = None
+
+    def monotonic(self) -> float:
+        return self.elapsed
+
+    def now(self) -> datetime:
+        return self.base + timedelta(seconds=self.elapsed)
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        if len(self.sleeps) == 1:
+            if self.coordinator._rate_lock.locked():
+                raise AssertionError("rate lock was held while a gate waiter slept")
+            self.elapsed = 1.0
+            self.coordinator.record_429()
+            self.elapsed = 10.0
+            return
+        self.elapsed += seconds
+
+
 class FailingWriteStore(ResultStore):
     def __init__(self, path: Path, failure: Exception):
         super().__init__(path)
@@ -275,6 +302,19 @@ class CoordinationTests(unittest.TestCase):
         self.assertEqual(len(passed), 5)
         self.assertEqual(clock.sleeps, [10])
 
+    def test_overlapping_second_429_extends_from_observation_without_locking_sleeper(self):
+        """Catches a sleeping waiter delaying publication and turning max into addition."""
+        clock = Overlapping429Clock()
+        coordinator = self.make_coordinator(clock=clock)
+        clock.coordinator = coordinator
+
+        coordinator.record_429()
+        coordinator.before_api_call()
+
+        self.assertEqual(clock.sleeps, [10, 11])
+        self.assertEqual(clock.monotonic(), 21)
+        self.assertEqual(coordinator._blocked_until, 21)
+
     def test_wait_until_converges_with_later_rate_limit_deadline(self):
         clock = LockedManualClock()
         coordinator = self.make_coordinator(clock=clock)
@@ -285,12 +325,11 @@ class CoordinationTests(unittest.TestCase):
 
         self.assertEqual(clock.sleeps, [20])
 
-    def test_wait_until_publishes_later_deadline_to_shared_rate_limit_gate(self):
+    def test_wait_until_keeps_recipient_deadline_out_of_shared_rate_limit_gate(self):
+        """Catches a recipient-local delay mutating the run-global 429 deadline."""
         clock = BlockingManualClock()
         coordinator = self.make_coordinator(clock=clock)
         errors = []
-
-        coordinator.record_429()
 
         def wait_worker() -> None:
             try:
@@ -298,27 +337,18 @@ class CoordinationTests(unittest.TestCase):
             except Exception as exc:  # pragma: no cover - asserted through errors
                 errors.append(exc)
 
-        def api_worker() -> None:
-            try:
-                coordinator.before_api_call()
-            except Exception as exc:  # pragma: no cover - asserted through errors
-                errors.append(exc)
-
         wait_thread = threading.Thread(target=wait_worker)
-        api_thread = threading.Thread(target=api_worker)
 
         wait_thread.start()
         self.assertTrue(clock.wait_for_sleep_count(1))
-
-        api_thread.start()
-        self.assertFalse(clock.wait_for_sleep_count(2, timeout=0.2))
+        blocked_until_while_local_wait_is_active = coordinator._blocked_until
         self.assertEqual(clock.sleeps, [20])
 
         clock.advance(20)
         wait_thread.join()
-        api_thread.join()
 
         self.assertEqual(errors, [])
+        self.assertEqual(blocked_until_while_local_wait_is_active, 0)
 
     def test_checkpoint_failure_stops_later_commits_events_and_api_calls(self):
         failure = OSError("checkpoint unavailable")

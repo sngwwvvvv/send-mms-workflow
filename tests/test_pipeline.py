@@ -97,6 +97,19 @@ class AdvancingEventLog(RecordingEventLog):
             self.clock.value += 5
 
 
+class GateInjectingEventLog(RecordingEventLog):
+    def __init__(self):
+        super().__init__()
+        self.coordinator = None
+        self.injected = False
+
+    def write(self, event, **fields):
+        super().write(event, **fields)
+        if event == "SEND_ATTEMPT_STARTED" and not self.injected:
+            self.injected = True
+            self.coordinator.record_429()
+
+
 class FailingStore(ResultStore):
     def __init__(self, path, fail_replace):
         super().__init__(path)
@@ -170,6 +183,17 @@ class ScriptedPipelineApi:
     def get_message(self, message_id):
         self.calls.append(("get", message_id))
         return self._next(self.gets)
+
+
+class TimestampingPipelineApi(ScriptedPipelineApi):
+    def __init__(self, *, clock=None, **kwargs):
+        super().__init__(**kwargs)
+        self.clock = clock
+        self.send_times = []
+
+    def send_one(self, to, file_ids, *, content_type):
+        self.send_times.append(self.clock.monotonic())
+        return super().send_one(to, file_ids, content_type=content_type)
 
 
 def send_response(request_id="request-1"):
@@ -300,6 +324,28 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual((self.persisted().attempts, self.persisted().request_id), (1, ""))
         with self.assertRaises(RunSafetyError):
             coordinator.raise_if_stopped()
+
+    def test_429_published_during_attempt_durability_is_rechecked_before_post(self):
+        """Catches POST bypassing a 429 observed after its first gate check."""
+        log = GateInjectingEventLog()
+        api = TimestampingPipelineApi(
+            sends=(send_response(),),
+            lists=(list_response(message("READY")),),
+            gets=(result_response(message("COMPLETED", "success")),),
+        )
+        pipeline, clock, _, coordinator = self.make_pipeline(
+            api,
+            reservation(),
+            event_log=log,
+        )
+        log.coordinator = coordinator
+        api.clock = clock
+
+        result = pipeline.run(reservation(), work(), ("file-1", "file-2"))
+
+        self.assertEqual(result.row.delivery_status, "SENT")
+        self.assertEqual(api.send_times, [10])
+        self.assertEqual(clock.sleeps, [10])
 
     def test_send_attempt_started_event_failure_preserves_attempt_and_starts_no_post(self):
         """Catches a failed SEND_ATTEMPT_STARTED write being swallowed before POST."""
@@ -626,6 +672,51 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(result.row.delivery_status, "SENT")
         self.assertEqual(clock.sleeps, [10])
         self.assertEqual([call[0] for call in api.calls], ["send", "list", "get"])
+
+    def test_retry_action_waits_only_to_carried_absolute_deadline(self):
+        """Catches phase-two retry reconstructing a fresh ten-second delay."""
+        row = reservation(
+            attempts=1,
+            request_id="request-1",
+            message_id="message-1",
+        )
+        api = ScriptedPipelineApi(
+            sends=(send_response("request-2"),),
+            lists=(
+                list_response(
+                    message(
+                        "PROCESSING",
+                        request_id="request-2",
+                        message_id="message-2",
+                    )
+                ),
+            ),
+            gets=(
+                result_response(
+                    message(
+                        "COMPLETED",
+                        "success",
+                        request_id="request-2",
+                        message_id="message-2",
+                    )
+                ),
+            ),
+        )
+        pipeline, clock, _, _ = self.make_pipeline(api, row)
+        clock.value = 7
+        approved = ApprovedWork(
+            NUMBER,
+            "RETRY_EXPLICIT",
+            True,
+            DELIVERY_ID,
+            retry_not_before=10.0,
+        )
+
+        result = pipeline.run(row, approved, ("file-1", "file-2"))
+
+        self.assertEqual(result.row.delivery_status, "SENT")
+        self.assertEqual(clock.sleeps, [3])
+        self.assertEqual(clock.monotonic(), 10)
 
     def test_invalid_action_state_combinations_never_post_or_change_the_row(self):
         """Catches terminal or ineligible rows being rewritten and posted."""

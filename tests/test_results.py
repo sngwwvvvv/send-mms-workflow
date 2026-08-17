@@ -393,6 +393,31 @@ class ResultTests(unittest.TestCase):
             self.assertEqual(snapshot_path.name, "result_20260815_000102.csv")
             self.assertEqual(snapshot_path.read_bytes(), store.path.read_bytes())
 
+    def test_archive_current_preserves_exact_valid_current_bytes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = ResultStore.for_root(Path(directory))
+            store.path.parent.mkdir(parents=True)
+            payload = (
+                b"\xef\xbb\xbfreceiving_number,delivery_id,delivery_status,is_sent,"
+                b"attempts,request_id,message_id,error\r\n"
+                b"0102,ABCDEFGH23456789,SENT,true,2,r2,m2,null\r\n"
+                b"0101,23456789ABCDEFGH,SENT,true,1,r1,m1,null\r\n"
+            )
+            store.path.write_bytes(payload)
+            archive_current = getattr(store, "archive_current", None)
+            self.assertTrue(
+                callable(archive_current),
+                "ResultStore.archive_current must be available",
+            )
+
+            archive_path = archive_current(
+                datetime(2026, 8, 14, 15, 1, 2, tzinfo=timezone.utc)
+            )
+
+            self.assertEqual(archive_path.name, "result_20260815_000102.csv")
+            self.assertEqual(archive_path.read_bytes(), payload)
+            self.assertEqual(store.path.read_bytes(), payload)
+
     def test_snapshot_uses_next_suffix_without_overwriting_history(self):
         with tempfile.TemporaryDirectory() as directory:
             store = ResultStore.for_root(Path(directory))

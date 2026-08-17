@@ -93,6 +93,7 @@ class RunCoordinator:
 
     def record_429(self) -> None:
         self.raise_if_stopped()
+        observed_at = self.clock.monotonic()
         with self._rate_lock:
             self.raise_if_stopped()
             self._rate_limit_count += 1
@@ -103,21 +104,25 @@ class RunCoordinator:
             )
             self._blocked_until = max(
                 self._blocked_until,
-                self.clock.monotonic() + delay,
+                observed_at + delay,
             )
 
     def before_api_call(self) -> None:
-        self.raise_if_stopped()
-        with self._rate_lock:
+        while True:
             self.raise_if_stopped()
-            remaining = self._blocked_until - self.clock.monotonic()
-            if remaining > 0:
-                self.clock.sleep(remaining)
+            with self._rate_lock:
+                self.raise_if_stopped()
+                remaining = self._blocked_until - self.clock.monotonic()
+            if remaining <= 0:
+                break
+            self.clock.sleep(remaining)
         self.raise_if_stopped()
 
     def wait_until(self, deadline: float) -> None:
-        self.raise_if_stopped()
-        with self._rate_lock:
+        while True:
             self.raise_if_stopped()
-            self._blocked_until = max(self._blocked_until, deadline)
-        self.before_api_call()
+            remaining = deadline - self.clock.monotonic()
+            if remaining <= 0:
+                break
+            self.clock.sleep(remaining)
+        self.raise_if_stopped()

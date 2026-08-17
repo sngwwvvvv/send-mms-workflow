@@ -30,6 +30,7 @@ class ApprovedWork:
     action: WorkAction
     allow_retry_after_explicit_failure: bool
     source_delivery_id: str = field(default="", repr=False)
+    retry_not_before: float | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True)
@@ -49,6 +50,7 @@ class PreflightReport:
     mode: str
     resend_source: str | None
     resend_source_sha256: str | None
+    approved_result_state: str = field(repr=False)
 
     def to_public_dict(self):
         work_groups = {
@@ -133,6 +135,18 @@ def result_row_identity(row):
     }
 
 
+def canonical_result_state(rows) -> str:
+    return json.dumps(
+        [
+            result_row_identity(row)
+            for row in sorted(rows, key=lambda row: row.receiving_number)
+        ],
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
 def classify_existing(row: ResultRow) -> ApprovedWork:
     if row.delivery_status != "PENDING_CONFIRMATION":
         raise ResultFormatError("result row is not pending")
@@ -160,11 +174,29 @@ def classify_existing(row: ResultRow) -> ApprovedWork:
     )
 
 
+def classify_absent_pending(row: ResultRow) -> ApprovedWork:
+    classified = classify_existing(row)
+    if classified.action == "RECONCILE":
+        return ApprovedWork(
+            row.receiving_number,
+            "RECONCILE",
+            False,
+            row.delivery_id,
+        )
+    return ApprovedWork(
+        row.receiving_number,
+        "HOLD_AMBIGUOUS",
+        False,
+        row.delivery_id,
+    )
+
+
 def build_preflight(root, config, result_store, *, resend_failed=False):
     project_root = Path(root)
     recipients = load_recipients(project_root / "receiving_numbers.csv")
     images = validate_images(project_root / "mms_img")
     existing = result_store.load()
+    valid_numbers = set(recipients.valid_numbers)
     source_path = None
     source_hash = None
     if resend_failed:
@@ -194,7 +226,6 @@ def build_preflight(root, config, result_store, *, resend_failed=False):
             raise ResultFormatError(
                 "resend snapshot changed during preflight"
             ) from None
-        valid_numbers = set(recipients.valid_numbers)
         eligible_rows = []
         for row in failed_candidates:
             if (
@@ -229,6 +260,16 @@ def build_preflight(root, config, result_store, *, resend_failed=False):
     work_items = []
     pending = []
     resend_numbers = {row.receiving_number for row in eligible_rows}
+    for number in sorted(existing):
+        row = existing[number]
+        if row.delivery_status != "PENDING_CONFIRMATION":
+            continue
+        pending.append(number)
+        work_items.append(
+            classify_existing(row)
+            if number in valid_numbers
+            else classify_absent_pending(row)
+        )
     for number in recipients.valid_numbers:
         row = existing.get(number)
         if row is None:
@@ -237,8 +278,6 @@ def build_preflight(root, config, result_store, *, resend_failed=False):
                 eligible += (number,)
             continue
         if row.delivery_status == "PENDING_CONFIRMATION":
-            pending.append(number)
-            work_items.append(classify_existing(row))
             continue
         if resend_failed and number in resend_numbers:
             work_items.append(ApprovedWork(number, "START_FRESH", True, row.delivery_id))
@@ -283,7 +322,15 @@ def build_preflight(root, config, result_store, *, resend_failed=False):
         ).encode()
     ).hexdigest()
     return PreflightReport(
-        total=len(recipients.valid_numbers) + len(recipients.failures),
+        total=(
+            len(recipients.valid_numbers)
+            + len(recipients.failures)
+            + sum(
+                row.delivery_status == "PENDING_CONFIRMATION"
+                and number not in valid_numbers
+                for number, row in existing.items()
+            )
+        ),
         eligible_numbers=eligible,
         eligible_rows=tuple(eligible_rows),
         pending_numbers=pending,
@@ -298,4 +345,5 @@ def build_preflight(root, config, result_store, *, resend_failed=False):
         mode="resend_failed" if resend_failed else "normal",
         resend_source=source_path.name if source_path else None,
         resend_source_sha256=source_hash,
+        approved_result_state=canonical_result_state(existing.values()),
     )

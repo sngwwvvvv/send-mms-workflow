@@ -381,6 +381,50 @@ class ResultStore:
             if os.path.exists(temporary_path):
                 os.unlink(temporary_path)
 
+    def archive_current(self, archived_at: datetime) -> Path:
+        """Publish an immutable, byte-exact copy of the current checkpoint."""
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        seoul_zone = ZoneInfo("Asia/Seoul")
+        seoul_time = (
+            archived_at.replace(tzinfo=seoul_zone)
+            if archived_at.tzinfo is None
+            else archived_at.astimezone(seoul_zone)
+        )
+        stem = seoul_time.strftime("result_%Y%m%d_%H%M%S")
+        try:
+            payload = self.path.read_bytes()
+            file_descriptor, temporary_path = tempfile.mkstemp(
+                prefix=".archive-", suffix=".csv", dir=self.path.parent
+            )
+        except OSError as exc:
+            raise ResultFormatError("result archive unavailable") from exc
+
+        try:
+            with os.fdopen(file_descriptor, "wb") as file:
+                file.write(payload)
+                file.flush()
+                os.fsync(file.fileno())
+            ResultStore(Path(temporary_path)).load()
+
+            for suffix in range(1000):
+                name = f"{stem}.csv" if suffix == 0 else f"{stem}_{suffix:03d}.csv"
+                destination = self.path.parent / name
+                try:
+                    os.link(temporary_path, destination)
+                except FileExistsError:
+                    continue
+                except OSError as exc:
+                    raise ResultFormatError("result archive unavailable") from exc
+                return destination
+            raise ResultFormatError("snapshot collision limit exceeded")
+        except ResultFormatError:
+            raise
+        except OSError as exc:
+            raise ResultFormatError("result archive unavailable") from exc
+        finally:
+            if os.path.exists(temporary_path):
+                os.unlink(temporary_path)
+
 
 def _load_legacy_rows(payload: bytes) -> dict[str, ResultRow]:
     try:

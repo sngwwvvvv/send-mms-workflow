@@ -212,6 +212,64 @@ class PreflightTests(unittest.TestCase):
         )
         self.assertEqual(report.pending_numbers, (FIRST, SECOND, THIRD))
 
+    def test_preflight_includes_every_absent_durable_pending_before_new_input(self):
+        """Catches durable pending work disappearing when it leaves the current CSV."""
+        fourth = "01044444444"
+        root = root_with_inputs((SECOND,))
+        seed_current(
+            root,
+            (
+                pending_with_ids(
+                    FIRST,
+                    attempts=1,
+                    delivery_id="23456789ABCDEFGH",
+                ),
+                pending_reservation(
+                    THIRD,
+                    delivery_id="3456789ABCDEFGHJ",
+                ),
+                pending_blank_ids(
+                    fourth,
+                    attempts=1,
+                    delivery_id="456789ABCDEFGHJK",
+                ),
+            ),
+        )
+
+        report = build_preflight(root, config(), ResultStore.for_root(root))
+        public = report.to_public_dict()
+
+        self.assertEqual(
+            tuple(
+                (
+                    item.receiving_number,
+                    item.action,
+                    item.allow_retry_after_explicit_failure,
+                )
+                for item in report.work_items
+            ),
+            (
+                (FIRST, "RECONCILE", False),
+                (THIRD, "HOLD_AMBIGUOUS", False),
+                (fourth, "HOLD_AMBIGUOUS", False),
+                (SECOND, "START_FRESH", True),
+            ),
+        )
+        self.assertEqual(report.pending_numbers, (FIRST, THIRD, fourth))
+        self.assertEqual(report.total, 4)
+        self.assertEqual(public["pending_reconciliation_count"], 1)
+        self.assertEqual(public["pending_masked_samples"], ("*******1111",))
+        self.assertFalse(public["pending_explicit_failure_may_retry"])
+        self.assertEqual(public["reservation_resume_count"], 0)
+        self.assertEqual(public["ambiguous_hold_count"], 2)
+        self.assertEqual(
+            public["ambiguous_hold_masked_samples"],
+            ("*******3333", "*******4444"),
+        )
+        rendered = json.dumps(public, ensure_ascii=False)
+        for number in (FIRST, SECOND, THIRD, fourth):
+            self.assertNotIn(number, rendered)
+
     def test_preflight_classifies_new_input_as_start_fresh_with_retry_allowed(self):
         root = root_with_inputs((FIRST,))
 
