@@ -56,13 +56,13 @@ rate_limit_delays_seconds=[10,20]
 
 ## 절대 안전 규칙
 
-- 승인된 Python 발송 프로그램만 필요한 자격증명을 프로세스 메모리에 적재하기 위한 목적으로 프로젝트 루트의 `.env`를 읽을 수 있다. 에이전트, 셸, 테스트는 `.env`를 직접 열거나 내용을 출력하지 않는다. 로더는 허용된 키의 존재 여부만 검증하며 비밀값을 로그, 오류, 문서 또는 `result.csv`에 기록하지 않는다.
+- 승인된 Python 발송 프로그램만 필요한 자격증명을 프로세스 메모리에 적재하기 위한 목적으로 프로젝트 루트의 `.env`를 읽을 수 있다. 에이전트, 셸, 테스트는 `.env`를 직접 열거나 내용을 출력하지 않는다. 로더는 허용된 키의 존재 여부만 검증하며 비밀값을 로그, 오류, 문서 또는 `results/result.csv`에 기록하지 않는다.
 - 매 실발송 실행 직전에 사용자의 새롭고 명시적인 승인을 받아야 한다.
 - 승인 전에 수신 건수, 마스킹된 번호 표본, 발신번호, 정확한 본문, 첨부 파일명, 이미지 검증 결과, `contentType`을 제시한다.
 - 구현, 테스트, 드라이런 또는 문서 검증을 실발송 승인으로 간주하지 않는다.
 - 테스트에서는 실제 SENS 발송 API와 실제 수신번호를 사용하지 않는다.
 - 실제 POST 가능성이 있는 `PENDING_CONFIRMATION`이나 접수 여부가 불확실한 번호에는 어떤 이유로도 새 발송 요청을 보내지 않는다.
-- 기존 `result.csv`를 읽고 조정하기 전에는 신규 발송을 시작하지 않는다.
+- 기존 `results/result.csv`를 읽고 조정하기 전에는 신규 발송을 시작하지 않는다.
 
 ## 프로젝트 입력
 
@@ -118,7 +118,7 @@ error={"status":"VALIDATION_ERROR","message":"수신번호 검증 실패 사유"
 ## 인증과 요청 서명
 
 - Access Key, Secret Key, SENS 서비스 ID, 등록된 발신번호는 환경변수 또는 승인된 비밀 저장소에서만 읽는다.
-- 비밀값이나 생성된 서명을 코드, 문서, 테스트 데이터, 로그, 보고서 또는 `result.csv`에 기록하지 않는다.
+- 비밀값이나 생성된 서명을 코드, 문서, 테스트 데이터, 로그, 보고서 또는 `results/result.csv`에 기록하지 않는다.
 - 공식 명세에 따라 모든 API 요청마다 현재 타임스탬프와 요청 경로를 사용해 HMAC-SHA256 서명을 생성한다.
 - 시스템 시간과 API Gateway 시간 차가 인증 허용 범위를 넘지 않는지 확인한다.
 
@@ -133,7 +133,7 @@ error={"status":"VALIDATION_ERROR","message":"수신번호 검증 실패 사유"
 5. 이미지가 정확히 두 개이며 형식, 크기, 해상도 제한을 만족한다.
 6. 본문이 승인된 내용과 정확히 일치한다.
 7. `contentType`이 사용자에게 확인됐다.
-8. 기존 `result.csv`의 `SENT`, `FAILED`, `PENDING_CONFIRMATION` 상태를 조정했다.
+8. 기존 `results/result.csv`의 `SENT`, `FAILED`, `PENDING_CONFIRMATION` 상태를 조정했다.
 
 이 결과와 실제 발송 대상을 사용자에게 제시하고 해당 실행에 대한 명시적 승인을 받은 뒤에만 POST 요청을 허용한다.
 
@@ -186,7 +186,7 @@ PENDING_CONFIRMATION은 실패가 아니다. `PENDING_CONFIRMATION`인 동안 `i
 
 이 경우 `PENDING_CONFIRMATION`으로 저장하고 재발송하지 않는다. `requestId` 또는 `messageId`가 있으면 이후 실행에서 같은 요청을 우선 조회한다. 식별자가 없는 모호한 POST는 요청 시각과 수신번호로 발송 목록을 조회하되 기존 요청을 유일하게 식별할 수 없으면 자동 재발송하지 않고 수동 확인 대상으로 보고한다.
 
-## result.csv 형식
+## results/result.csv 형식
 
 - 결과 경로는 프로젝트 루트의 `results/result.csv`다.
 - UTF-8로 저장하고 정규화된 수신번호당 한 행을 유지한다.
@@ -202,21 +202,21 @@ receiving_number,delivery_id,delivery_status,is_sent,attempts,request_id,message
 - `FAILED`는 `is_sent=false`이며 최종 명시적 실패의 정제된 코드와 비식별 고정 문구를 `error`에 기록한다.
 - `PENDING_CONFIRMATION`은 `is_sent`는 빈 값, `error=null`이며 가능한 요청 식별자를 보존한다.
 - 모든 상태 전이 직후 결과를 갱신한다.
-- 기존 파일 손상을 막기 위해 같은 디렉터리의 임시 파일에 전체 내용을 쓴 뒤 원자적으로 `result.csv`를 교체한다.
-- 기존 `result.csv`를 무조건 초기화하거나 성공 행을 삭제하지 않는다.
+- 기존 파일 손상을 막기 위해 같은 디렉터리의 임시 파일에 전체 내용을 쓴 뒤 원자적으로 `results/result.csv`를 교체한다.
+- 기존 `results/result.csv`를 무조건 초기화하거나 성공 행을 삭제하지 않는다.
 
 ## 재실행과 별도 재발송
 
 모든 재실행은 신규 발송보다 기존 상태 조정을 먼저 수행한다.
 
-1. 기존 `result.csv`를 읽는다.
+1. 기존 `results/result.csv`를 읽는다.
 2. 모든 `PENDING_CONFIRMATION` 요청을 저장된 식별자로 다시 조회한다.
 3. 나중에 성공한 요청은 `SENT`로 갱신한다.
 4. 나중에 명시적 실패한 요청만 현재 승인 실행의 남은 횟수에 따라 재시도하거나 `FAILED`로 전환한다.
 5. 여전히 미확정인 번호는 보류하고 새 POST를 금지한다.
 6. `SENT` 번호는 항상 발송 대상에서 제외한다.
 7. 이전 실행의 `FAILED` 번호는 사용자가 대상과 새 실행을 명시적으로 승인한 경우에만 다시 보낸다.
-8. 별도 재발송 실행 전에 기존 `result.csv`를 타임스탬프가 포함된 보관 파일로 복사한다.
+8. 별도 재발송 실행 전에 기존 `results/result.csv`를 타임스탬프가 포함된 보관 파일로 복사한다.
 9. 별도 실행 대상으로 승인된 `FAILED` 번호만 `attempts=0`부터 다시 계산한다.
 10. `PENDING_CONFIRMATION` 번호의 횟수와 상태는 초기화하지 않는다.
 
@@ -224,7 +224,7 @@ receiving_number,delivery_id,delivery_status,is_sent,attempts,request_id,message
 
 - 수신번호와 이름을 일반 로그, 콘솔 출력, 오류 메시지 또는 완료 보고에 평문으로 노출하지 않는다.
 - 번호 표시가 필요하면 마지막 네 자리만 남기고 마스킹한다.
-- `result.csv`에는 결과 식별을 위해 정규화된 `receiving_number`를 저장할 수 있다.
+- `results/result.csv`에는 결과 식별을 위해 정규화된 `receiving_number`를 저장할 수 있다.
 - API 요청 본문 전체, 인증 헤더, 서명, Access Key, Secret Key는 로그에 남기지 않는다.
 - 사용자에게 보고하는 API 오류에서도 비밀값과 개인정보를 제거한다.
 
@@ -241,7 +241,7 @@ receiving_number,delivery_id,delivery_status,is_sent,attempts,request_id,message
 - 재실행 시 `SENT`와 `PENDING_CONFIRMATION`의 신규 발송 차단
 - 중복 수신번호 단일 발송
 - 입력 번호와 이미지 검증 실패의 사전 차단
-- `result.csv` 복구와 원자적 교체
+- `results/result.csv` 복구와 원자적 교체
 
 작업 완료 보고에는 다음만 포함한다.
 

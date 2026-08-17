@@ -2,7 +2,7 @@
 
 작성일: 2026-08-17  
 상태: 확정  
-대체 문서: `2026-08-16-sens-lms-then-mms-worker-pipeline-design.md`
+이전 문서: `2026-08-16-sens-lms-then-mms-worker-pipeline-design.md`
 
 ## 1. 목적과 범위
 
