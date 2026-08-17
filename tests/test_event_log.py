@@ -26,6 +26,7 @@ def message_record():
     return MessageRecord(
         request_id="request-1",
         message_id="message-1",
+        message_type="MMS",
         to="01012345678",
         request_time="2026-08-13 10:00:00",
         complete_time="2026-08-13 10:00:30",
@@ -362,6 +363,7 @@ class EventLogTests(unittest.TestCase):
 
         self.assertEqual(actual, serialized_message())
         self.assertNotIn("to", actual)
+        self.assertNotIn("type", actual)
         self.assertNotIn("01012345678", json.dumps(actual))
 
     def test_list_response_serializer_includes_safe_envelope_and_serialized_messages(self):
@@ -655,6 +657,7 @@ class EventLogTests(unittest.TestCase):
         record = MessageRecord(
             request_id="request-correlation-unchanged",
             message_id="message-correlation-unchanged",
+            message_type="MMS",
             to="01012345678",
             request_time="2026-08-13 10:00:00",
             complete_time="2026-08-13 10:00:30",
@@ -746,6 +749,7 @@ class EventLogTests(unittest.TestCase):
         record = MessageRecord(
             request_id="request-correlation-unchanged",
             message_id="message-correlation-unchanged",
+            message_type="MMS",
             to="01012345678",
             request_time=secret,
             complete_time=secret,
@@ -806,6 +810,7 @@ class EventLogTests(unittest.TestCase):
         record = MessageRecord(
             request_id=record.request_id,
             message_id=record.message_id,
+            message_type=record.message_type,
             to=record.to,
             request_time=record.request_time,
             complete_time=record.complete_time,
@@ -857,6 +862,7 @@ class EventLogTests(unittest.TestCase):
         record = MessageRecord(
             request_id=record.request_id,
             message_id=record.message_id,
+            message_type=record.message_type,
             to=record.to,
             request_time=record.request_time,
             complete_time=record.complete_time,

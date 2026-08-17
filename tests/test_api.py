@@ -14,6 +14,7 @@ from sens_mms.api import (
     UrlLibTransport,
     make_signature,
 )
+from sens_mms.inputs import MESSAGE_BODY
 
 
 class RecordingTransport:
@@ -80,7 +81,7 @@ class ApiTests(unittest.TestCase):
         )
         self.assertEqual(signature, "7lLIUF/vg70uc1AkCmekGjUxqT5ekiPPnwKqwZrI6qI=")
 
-    def test_send_one_builds_one_recipient_without_subject_and_keeps_file_order(self):
+    def test_send_one_builds_exact_approved_integrated_mms(self):
         transport = RecordingTransport([response(202, {
             "requestId": "request-1",
             "requestTime": "2026-08-13T10:00:00.000",
@@ -88,7 +89,9 @@ class ApiTests(unittest.TestCase):
             "statusName": "success",
         })])
 
-        actual = client(transport).send_one("01012345678", ["file-1", "file-2"])
+        actual = client(transport).send_one(
+            "01012345678", ("file-1", "file-2"), content_type="COMM"
+        )
 
         self.assertEqual(actual.http_status, 202)
         self.assertEqual(actual.request_id, "request-1")
@@ -99,10 +102,52 @@ class ApiTests(unittest.TestCase):
         payload = json.loads(body)
         self.assertEqual(method, "POST")
         self.assertTrue(url.endswith("/sms/v2/services/svc/messages"))
-        self.assertEqual(payload["messages"], [{"to": "01012345678"}])
+        self.assertEqual(payload, {
+            "type": "MMS",
+            "contentType": "COMM",
+            "countryCode": "82",
+            "from": "0212345678",
+            "content": MESSAGE_BODY,
+            "messages": [{"to": "01012345678"}],
+            "files": [{"fileId": "file-1"}, {"fileId": "file-2"}],
+        })
         self.assertNotIn("subject", payload)
-        self.assertEqual(payload["files"], [{"fileId": "file-1"}, {"fileId": "file-2"}])
         self.assertEqual(headers["x-ncp-apigw-timestamp"], "1700000000000")
+
+    def test_send_one_accepts_exact_ad_content_type(self):
+        transport = RecordingTransport([response(202, {
+            "requestId": "request-1",
+            "requestTime": "2026-08-13T10:00:00.000",
+            "statusCode": "202",
+            "statusName": "success",
+        })])
+
+        client(transport).send_one(
+            "01012345678", ("file-1", "file-2"), content_type="AD"
+        )
+
+        payload = json.loads(transport.calls[0][3])
+        self.assertEqual(payload["contentType"], "AD")
+
+    def test_send_one_rejects_non_exact_or_unallowlisted_content_type_before_transport(self):
+        class ContentTypeSubclass(str):
+            pass
+
+        invalid_values = ("", "comm", "MMS", None, ContentTypeSubclass("COMM"))
+        for content_type in invalid_values:
+            with self.subTest(content_type=repr(content_type)):
+                transport = RecordingTransport([])
+
+                with self.assertRaises(ExplicitApiFailure) as raised:
+                    client(transport).send_one(
+                        "01012345678",
+                        ("file-1", "file-2"),
+                        content_type=content_type,
+                    )
+
+                self.assertEqual(raised.exception.status, "INVALID_REQUEST")
+                self.assertEqual(raised.exception.message, "content type is invalid")
+                self.assertEqual(transport.calls, [])
 
     def test_list_query_is_part_of_signed_uri(self):
         transport = RecordingTransport([response(200, {
@@ -175,7 +220,9 @@ class ApiTests(unittest.TestCase):
         transport = RecordingTransport([socket.timeout("timed out")])
 
         with self.assertRaises(AmbiguousPostOutcome):
-            client(transport).send_one("01012345678", ["file-1", "file-2"])
+            client(transport).send_one(
+                "01012345678", ["file-1", "file-2"], content_type="COMM"
+            )
 
     def test_two_xx_send_non_mapping_json_is_ambiguous_without_raw_marker(self):
         marker = "SEND_TOP_LEVEL_MARKER_01012345678"
@@ -185,7 +232,9 @@ class ApiTests(unittest.TestCase):
 
                 with self.assertRaises(AmbiguousPostOutcome) as raised:
                     client(transport).send_one(
-                        "01012345678", ["file-1", "file-2"]
+                        "01012345678",
+                        ["file-1", "file-2"],
+                        content_type="COMM",
                     )
 
                 self.assertNotIn(marker, repr(raised.exception))
@@ -205,7 +254,9 @@ class ApiTests(unittest.TestCase):
 
                 with self.assertRaises(AmbiguousPostOutcome) as raised:
                     client(transport).send_one(
-                        "01012345678", ["file-1", "file-2"]
+                        "01012345678",
+                        ["file-1", "file-2"],
+                        content_type="COMM",
                     )
 
                 self.assertNotIn(marker, repr(raised.exception))
@@ -222,7 +273,9 @@ class ApiTests(unittest.TestCase):
 
                 with self.assertRaises(AmbiguousPostOutcome) as raised:
                     client(transport).send_one(
-                        "01012345678", ["file-1", "file-2"]
+                        "01012345678",
+                        ["file-1", "file-2"],
+                        content_type="COMM",
                     )
 
                 self.assertEqual(
@@ -245,7 +298,9 @@ class ApiTests(unittest.TestCase):
 
                 with self.assertRaises(AmbiguousPostOutcome) as raised:
                     client(transport).send_one(
-                        "01012345678", ["file-1", "file-2"]
+                        "01012345678",
+                        ["file-1", "file-2"],
+                        content_type="COMM",
                     )
 
                 self.assertNotIn(marker, repr(raised.exception))
@@ -254,7 +309,9 @@ class ApiTests(unittest.TestCase):
         transport = RecordingTransport([ApiResponse(400, b"not-json", {})])
 
         with self.assertRaises(ExplicitApiFailure) as raised:
-            client(transport).send_one("01012345678", ["file-1", "file-2"])
+            client(transport).send_one(
+                "01012345678", ["file-1", "file-2"], content_type="COMM"
+            )
 
         self.assertEqual(raised.exception.status, "400")
         self.assertEqual(raised.exception.http_status, 400)
@@ -273,7 +330,9 @@ class ApiTests(unittest.TestCase):
         })])
 
         with self.assertRaises(ExplicitApiFailure) as raised:
-            client(transport).send_one("01012345678", ["file-1", "file-2"])
+            client(transport).send_one(
+                "01012345678", ["file-1", "file-2"], content_type="COMM"
+            )
 
         self.assertEqual(raised.exception.status, "400")
         self.assertEqual(raised.exception.message, "HTTP request failed")
@@ -297,7 +356,9 @@ class ApiTests(unittest.TestCase):
 
                 with self.assertRaises(ExplicitApiFailure) as raised:
                     client(transport).send_one(
-                        "01012345678", ["file-1", "file-2"]
+                        "01012345678",
+                        ["file-1", "file-2"],
+                        content_type="COMM",
                     )
 
                 failure = raised.exception
@@ -324,7 +385,7 @@ class ApiTests(unittest.TestCase):
 
         with self.assertRaises(ExplicitApiFailure) as raised:
             client(transport).send_one(
-                "01012345678", ["file-1", "file-2"]
+                "01012345678", ["file-1", "file-2"], content_type="COMM"
             )
 
         failure = raised.exception
@@ -347,7 +408,9 @@ class ApiTests(unittest.TestCase):
         })])
 
         with self.assertRaises(ExplicitApiFailure) as raised:
-            client(transport).send_one("01012345678", ["file-1", "file-2"])
+            client(transport).send_one(
+                "01012345678", ["file-1", "file-2"], content_type="COMM"
+            )
 
         self.assertNotIn("statusName", raised.exception.response)
         self.assertNotIn(compact_sensitive, str(raised.exception))
@@ -376,7 +439,9 @@ class ApiTests(unittest.TestCase):
 
                 with self.assertRaises(expected_type) as raised:
                     client(transport).send_one(
-                        "01012345678", ["file-1", "file-2"]
+                        "01012345678",
+                        ["file-1", "file-2"],
+                        content_type="COMM",
                     )
 
                 failure = raised.exception
@@ -412,6 +477,7 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(actual.status_name, "success")
         self.assertEqual(actual.message.request_id, "request-1")
         self.assertEqual(actual.message.message_id, "message-1")
+        self.assertEqual(actual.message.message_type, "MMS")
         self.assertEqual(actual.message.to, "01012345678")
         self.assertEqual(actual.message.status, "PROCESSING")
         for unsafe_attribute in (
@@ -422,7 +488,7 @@ class ApiTests(unittest.TestCase):
             "/sms/v2/services/svc/messages/message-1"
         ))
 
-    def test_time_recipient_lookup_encodes_all_identifying_filters(self):
+    def test_time_recipient_lookup_encodes_all_identifying_filters_and_mms_type(self):
         transport = RecordingTransport([response(200, {
             "statusCode": "202", "statusName": "success", "messages": []
         })])
@@ -435,12 +501,13 @@ class ApiTests(unittest.TestCase):
         self.assertIn("requestStartTime=2026-08-13+09%3A59%3A59", url)
         self.assertIn("requestEndTime=2026-08-13+10%3A00%3A30", url)
         self.assertIn("to=01012345678", url)
+        self.assertIn("type=MMS", url)
 
     def test_list_returns_typed_allowlisted_messages_and_page_envelope(self):
         transport = RecordingTransport([response(200, {
             "statusCode": "202",
             "statusName": "success",
-            "messages": [official_message()],
+            "messages": [official_message(type="SMS")],
             "pageSize": 10,
             "pageIndex": 0,
             "itemCount": 1,
@@ -453,6 +520,7 @@ class ApiTests(unittest.TestCase):
 
         self.assertEqual(actual.http_status, 200)
         self.assertEqual(actual.messages[0].message_id, "message-1")
+        self.assertEqual(actual.messages[0].message_type, "SMS")
         self.assertEqual(actual.page_size, 10)
         self.assertEqual(actual.page_index, 0)
         self.assertEqual(actual.item_count, 1)
@@ -481,6 +549,31 @@ class ApiTests(unittest.TestCase):
 
         with self.assertRaisesRegex(TransientLookupError, "omitted messages"):
             client(transport).list_by_request("request-1")
+
+    def test_get_http_errors_surface_transient_lookup_error_without_raw_api_message(self):
+        sensitive = "recipient 01012345678 rejected: unsafe content"
+        operations = (
+            lambda sens: sens.list_by_request("request-1"),
+            lambda sens: sens.get_message("message-1"),
+        )
+        for operation in operations:
+            with self.subTest(operation=operation):
+                transport = RecordingTransport([response(429, {
+                    "statusCode": "429",
+                    "statusName": "fail",
+                    "statusMessage": sensitive,
+                    "message": sensitive,
+                    "content": sensitive,
+                })])
+
+                with self.assertRaises(TransientLookupError) as raised:
+                    operation(client(transport))
+
+                self.assertEqual(
+                    str(raised.exception), "SENS lookup was not successful"
+                )
+                self.assertEqual(raised.exception.http_status, 429)
+                self.assertNotIn(sensitive, repr(raised.exception))
 
     def test_get_operations_reject_non_mapping_json_with_fixed_transient_error(self):
         marker = "LOOKUP_TOP_LEVEL_MARKER_01012345678"
