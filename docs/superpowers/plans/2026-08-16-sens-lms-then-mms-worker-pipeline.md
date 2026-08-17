@@ -1,5 +1,8 @@
 # SENS LMS-Then-MMS Worker Pipeline Implementation Plan
 
+작성일: 2026-08-16
+상태: 대체됨 — `2026-08-17-sens-mms-worker-pipeline.md`로 대체
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (\`- [ ]\`) syntax for tracking.
 
 **Goal:** Replace the experimental branch's one-recipient combined MMS workflow with a crash-safe five-worker pipeline that sends the approved LMS body first and sends an empty-body two-image MMS only after correlated LMS delivery success.
