@@ -1,4 +1,5 @@
 import csv
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import redirect_stderr
 from datetime import datetime
 from io import StringIO
@@ -7,6 +8,7 @@ import json
 from pathlib import Path
 from threading import Condition, Event, Lock, Thread
 import unittest
+from unittest.mock import patch
 from urllib.parse import parse_qs, urlparse
 from zoneinfo import ZoneInfo
 
@@ -1060,7 +1062,7 @@ class CliTests(unittest.TestCase):
         )
 
     def test_seven_recipients_use_fixed_five_worker_contract_and_one_post_each(self):
-        """Catches a sixth recipient POST entering a closed five-worker gate."""
+        """Catches any executor bound other than five while using real workers."""
         numbers = tuple(f"0100000000{index}" for index in range(1, 8))
         root = make_root(numbers)
         token = approval_token(root)
@@ -1074,6 +1076,14 @@ class CliTests(unittest.TestCase):
 
         outcome = {}
         finished = Event()
+        executor_constructed = Event()
+        observed_max_workers = []
+        real_executor = ThreadPoolExecutor
+
+        def recording_executor(max_workers=None, *args, **kwargs):
+            observed_max_workers.append(max_workers)
+            executor_constructed.set()
+            return real_executor(max_workers, *args, **kwargs)
 
         def invoke_cli():
             try:
@@ -1092,19 +1102,33 @@ class CliTests(unittest.TestCase):
                 finished.set()
 
         cli_thread = Thread(target=invoke_cli, name="seven-recipient-cli-test")
-        cli_thread.start()
+        constructed = False
+        five_entered = False
+        entered_count = None
+        finished_while_blocked = None
+        probe_error = None
         try:
-            self.assertTrue(transport.wait_for_message_entries(5))
-            self.assertFalse(
-                transport.wait_for_message_entries(6, timeout=0.2),
-                "a sixth message POST entered while the five-worker gate was closed",
-            )
-            self.assertEqual(len(transport.entered_message_recipients), 5)
-            self.assertFalse(finished.is_set())
+            with patch("sens_mms.workflow.ThreadPoolExecutor", recording_executor):
+                cli_thread.start()
+                constructed = executor_constructed.wait(timeout=5)
+                if constructed and observed_max_workers == [5]:
+                    five_entered = transport.wait_for_message_entries(5)
+                    entered_count = len(transport.entered_message_recipients)
+                    finished_while_blocked = finished.is_set()
+        except BaseException as exc:
+            probe_error = exc
         finally:
             transport.release_message_posts()
-        cli_thread.join(timeout=5)
+            if cli_thread.ident is not None:
+                cli_thread.join(timeout=5)
         self.assertFalse(cli_thread.is_alive(), "CLI worker test did not finish")
+        if probe_error is not None:
+            raise probe_error
+        self.assertTrue(constructed, "real executor construction was not observed")
+        self.assertEqual(observed_max_workers, [5])
+        self.assertTrue(five_entered, "five message POSTs did not reach the closed gate")
+        self.assertEqual(entered_count, 5)
+        self.assertFalse(finished_while_blocked)
         code, public, _ = outcome["result"]
 
         message_posts = [
