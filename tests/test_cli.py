@@ -5,7 +5,7 @@ from io import StringIO
 import inspect
 import json
 from pathlib import Path
-from threading import Lock
+from threading import Condition, Event, Lock, Thread
 import unittest
 from urllib.parse import parse_qs, urlparse
 from zoneinfo import ZoneInfo
@@ -143,6 +143,51 @@ class RecipientRoutingTransport:
                 },
             )
         raise AssertionError("unexpected network call")
+
+
+class FiveWorkerGateTransport(RecipientRoutingTransport):
+    def __init__(self, recipients):
+        super().__init__(recipients)
+        self._condition = Condition()
+        self._released = False
+        self.entered_message_recipients = []
+
+    def request(self, method, url, headers, body, timeout):
+        parsed = urlparse(url)
+        if not (method == "POST" and parsed.path.endswith("/messages")):
+            return super().request(method, url, headers, body, timeout)
+
+        with self._lock:
+            self.calls.append((method, url, dict(headers), body, timeout))
+        payload = json.loads(body.decode("utf-8"))
+        number = payload["messages"][0]["to"]
+        with self._condition:
+            self.entered_message_recipients.append(number)
+            self._condition.notify_all()
+            if not self._condition.wait_for(lambda: self._released, timeout=5):
+                raise AssertionError("message POST gate was not released")
+        request_id, _ = self._recipients[number]
+        return api_response(
+            202,
+            {
+                "requestId": request_id,
+                "requestTime": "2026-08-13T10:00:00.000",
+                "statusCode": "202",
+                "statusName": "success",
+            },
+        )
+
+    def wait_for_message_entries(self, count, *, timeout=5):
+        with self._condition:
+            return self._condition.wait_for(
+                lambda: len(self.entered_message_recipients) >= count,
+                timeout=timeout,
+            )
+
+    def release_message_posts(self):
+        with self._condition:
+            self._released = True
+            self._condition.notify_all()
 
 
 class FixedIdFactory:
@@ -603,7 +648,34 @@ class CliTests(unittest.TestCase):
         self.assertNotIn("subject", payload)
 
     def test_preflight_creates_no_event_log_and_never_calls_network(self):
-        root = make_root()
+        root = make_root((RECIPIENT, SECOND))
+        (root / "receiving_numbers.csv").write_text(
+            f"number,name\n{FORMATTED_RECIPIENT},{NAME}\n{SECOND},Second Private Name\n",
+            encoding="utf-8",
+        )
+        store = ResultStore.for_root(root)
+        store.upsert(
+            ResultRow(
+                receiving_number=RECIPIENT,
+                delivery_id=PENDING_ID,
+                delivery_status="PENDING_CONFIRMATION",
+                is_sent="",
+                attempts=1,
+                request_id=REQUEST_1,
+                message_id=MESSAGE_1,
+                error=None,
+            )
+        )
+        store.upsert(
+            failed_row(
+                SECOND,
+                OLD_ID_2,
+                REQUEST_2,
+                MESSAGE_2,
+                message="redacted",
+            )
+        )
+        store.write_atomic()
         transport = ScriptedHttpTransport()
         tracker = FactoryTracker()
 
@@ -633,14 +705,129 @@ class CliTests(unittest.TestCase):
         rendered = json.dumps(public, ensure_ascii=False)
         for forbidden in (
             RECIPIENT,
+            SECOND,
+            FORMATTED_RECIPIENT,
             NAME,
+            "Second Private Name",
+            PENDING_ID,
+            OLD_ID_2,
+            REQUEST_1,
+            REQUEST_2,
+            MESSAGE_1,
+            MESSAGE_2,
+            ENV["NCP_ACCESS_KEY_ID"],
+            ENV["NCP_SECRET_KEY"],
+            ENV["NCP_SENS_SERVICE_ID"],
+        ):
+            self.assertNotIn(forbidden, rendered)
+
+    def test_named_recipient_live_completion_excludes_real_boundary_sentinels(self):
+        """Catches completion copying named input, durable IDs, or sanitized API prose."""
+        root = make_root()
+        (root / "receiving_numbers.csv").write_text(
+            f"number,name\n{FORMATTED_RECIPIENT},{NAME}\n",
+            encoding="utf-8",
+        )
+        token = approval_token(root)
+        raw_api_prose = "carrier-private-status-detail"
+        processing = official_message(
+            RECIPIENT,
+            REQUEST_1,
+            MESSAGE_1,
+            "PROCESSING",
+            status_message=raw_api_prose,
+        )
+        completed = official_message(
+            RECIPIENT,
+            REQUEST_1,
+            MESSAGE_1,
+            "COMPLETED",
+            status_name="success",
+            status_code="0",
+            status_message=raw_api_prose,
+        )
+        transport = ScriptedHttpTransport(
+            [
+                api_response(200, {"fileId": FILE_1}),
+                api_response(200, {"fileId": FILE_2}),
+                api_response(
+                    202,
+                    {
+                        "requestId": REQUEST_1,
+                        "requestTime": "2026-08-13T10:00:00.000",
+                        "statusCode": "202",
+                        "statusName": "success",
+                    },
+                ),
+                api_response(
+                    200,
+                    {
+                        "statusCode": "202",
+                        "statusName": "success",
+                        "pageSize": 100,
+                        "pageIndex": 0,
+                        "itemCount": 1,
+                        "hasMore": False,
+                        "messages": [processing],
+                    },
+                ),
+                api_response(
+                    200,
+                    {
+                        "statusCode": "200",
+                        "statusName": "success",
+                        "messages": [completed],
+                    },
+                ),
+            ]
+        )
+
+        code, public, _ = run_cli(
+            ["live", "--approval-token", token, "--confirm-sender-registered"],
+            root,
+            transport=transport,
+            delivery_id_factory=FixedIdFactory(NEW_ID_1),
+        )
+
+        rendered = json.dumps(public, ensure_ascii=False)
+        signature = make_signature(
+            "POST",
+            f"/sms/v2/services/{ENV['NCP_SENS_SERVICE_ID']}/messages",
+            "1700000000000",
+            ENV["NCP_ACCESS_KEY_ID"],
+            ENV["NCP_SECRET_KEY"],
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            set(public),
+            {
+                "total",
+                "sent",
+                "failed",
+                "pending_confirmation",
+                "failed_error_summary",
+                "pending_follow_up_required",
+                "result_csv",
+                "live_send",
+                "approved_at",
+            },
+        )
+        for forbidden in (
+            RECIPIENT,
+            FORMATTED_RECIPIENT,
+            NAME,
+            ENV["NCP_SENS_FROM_NUMBER"],
+            MESSAGE_BODY,
             NEW_ID_1,
             REQUEST_1,
             MESSAGE_1,
             ENV["NCP_ACCESS_KEY_ID"],
             ENV["NCP_SECRET_KEY"],
             ENV["NCP_SENS_SERVICE_ID"],
-            "raw private error",
+            signature,
+            raw_api_prose,
+            "result_snapshot",
+            "event_log",
         ):
             self.assertNotIn(forbidden, rendered)
 
@@ -873,10 +1060,11 @@ class CliTests(unittest.TestCase):
         )
 
     def test_seven_recipients_use_fixed_five_worker_contract_and_one_post_each(self):
+        """Catches a sixth recipient POST entering a closed five-worker gate."""
         numbers = tuple(f"0100000000{index}" for index in range(1, 8))
         root = make_root(numbers)
         token = approval_token(root)
-        transport = RecipientRoutingTransport(
+        transport = FiveWorkerGateTransport(
             {
                 number: (f"request-{index}", f"message-{index}")
                 for index, number in enumerate(numbers, start=1)
@@ -884,12 +1072,40 @@ class CliTests(unittest.TestCase):
         )
         ids = tuple(str(index) * 16 for index in range(2, 9))
 
-        code, public, _ = run_cli(
-            ["live", "--approval-token", token, "--confirm-sender-registered"],
-            root,
-            transport=transport,
-            delivery_id_factory=FixedIdFactory(*ids),
-        )
+        outcome = {}
+        finished = Event()
+
+        def invoke_cli():
+            try:
+                outcome["result"] = run_cli(
+                    [
+                        "live",
+                        "--approval-token",
+                        token,
+                        "--confirm-sender-registered",
+                    ],
+                    root,
+                    transport=transport,
+                    delivery_id_factory=FixedIdFactory(*ids),
+                )
+            finally:
+                finished.set()
+
+        cli_thread = Thread(target=invoke_cli, name="seven-recipient-cli-test")
+        cli_thread.start()
+        try:
+            self.assertTrue(transport.wait_for_message_entries(5))
+            self.assertFalse(
+                transport.wait_for_message_entries(6, timeout=0.2),
+                "a sixth message POST entered while the five-worker gate was closed",
+            )
+            self.assertEqual(len(transport.entered_message_recipients), 5)
+            self.assertFalse(finished.is_set())
+        finally:
+            transport.release_message_posts()
+        cli_thread.join(timeout=5)
+        self.assertFalse(cli_thread.is_alive(), "CLI worker test did not finish")
+        code, public, _ = outcome["result"]
 
         message_posts = [
             call
@@ -928,6 +1144,7 @@ class CliTests(unittest.TestCase):
         self.assert_public_safe(public)
 
     def test_event_log_mid_run_failure_stops_later_recipient_and_keeps_accepted_pending(self):
+        """Catches posted/unposted atomic reservations persisting the wrong API boundary."""
         root = make_root((RECIPIENT, SECOND))
         token = approval_token(root)
         transport = RecipientRoutingTransport(
@@ -972,13 +1189,20 @@ class CliTests(unittest.TestCase):
         self.assertEqual(len(sent_numbers), len(set(sent_numbers)))
         self.assertEqual(lookup_calls, [])
         self.assertEqual(set(rows), {RECIPIENT, SECOND})
-        self.assertTrue(
-            any(
-                row.delivery_status == "PENDING_CONFIRMATION"
-                and row.request_id
-                for row in rows.values()
-            )
-        )
+        expected_requests = {RECIPIENT: REQUEST_1, SECOND: REQUEST_2}
+        posted = set(sent_numbers)
+        for number, row in rows.items():
+            self.assertEqual(row.delivery_status, "PENDING_CONFIRMATION")
+            self.assertEqual(row.is_sent, "")
+            self.assertIsNone(row.error)
+            if number in posted:
+                self.assertEqual(row.attempts, 1)
+                self.assertEqual(row.request_id, expected_requests[number])
+                self.assertEqual(row.message_id, "")
+            else:
+                self.assertEqual(row.attempts, 0)
+                self.assertEqual(row.request_id, "")
+                self.assertEqual(row.message_id, "")
         self.assertEqual(list((root / "results").glob("result_*.csv")), [])
         self.assert_public_safe(public)
 
