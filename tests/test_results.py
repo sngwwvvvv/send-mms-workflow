@@ -30,6 +30,88 @@ CHANGED_LEGACY_BYTES = (
 
 
 class ResultTests(unittest.TestCase):
+    def test_replace_rows_atomic_updates_multiple_rows_in_one_write(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = ResultStore(Path(directory) / "result.csv")
+            store.upsert(ResultRow(
+                receiving_number="0101",
+                delivery_id=VALID_ID,
+                delivery_status="PENDING_CONFIRMATION",
+                is_sent="",
+                attempts=0,
+            ))
+            store.write_atomic()
+            fresh = ResultStore(store.path)
+            original_bytes = store.path.read_bytes()
+
+            fresh.load()
+            fresh.replace_rows_atomic(
+                {"0101": ResultRow(
+                    receiving_number="0101",
+                    delivery_id=VALID_ID,
+                    delivery_status="PENDING_CONFIRMATION",
+                    is_sent="",
+                    attempts=0,
+                )},
+                (
+                    ResultRow(
+                        receiving_number="0101",
+                        delivery_id=VALID_ID,
+                        delivery_status="SENT",
+                        is_sent="true",
+                        attempts=1,
+                    ),
+                    ResultRow(
+                        receiving_number="0102",
+                        delivery_id="23456789ABCDEFGJ",
+                        delivery_status="PENDING_CONFIRMATION",
+                        is_sent="",
+                        attempts=0,
+                    ),
+                ),
+            )
+
+            loaded = ResultStore(store.path).load()
+            self.assertEqual(set(loaded), {"0101", "0102"})
+            self.assertEqual(loaded["0101"].delivery_status, "SENT")
+            self.assertNotEqual(store.path.read_bytes(), original_bytes)
+
+    def test_replace_rows_atomic_rejects_stale_expected_rows_without_partial_write(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = ResultStore(Path(directory) / "result.csv")
+            current = ResultRow(
+                receiving_number="0101",
+                delivery_id=VALID_ID,
+                delivery_status="PENDING_CONFIRMATION",
+                is_sent="",
+                attempts=0,
+            )
+            store.upsert(current)
+            store.write_atomic()
+            original_bytes = store.path.read_bytes()
+            fresh = ResultStore(store.path)
+            fresh.load()
+
+            with self.assertRaises(ResultFormatError):
+                fresh.replace_rows_atomic(
+                    {"0101": ResultRow(
+                        receiving_number="0101",
+                        delivery_id="23456789ABCDEFGJ",
+                        delivery_status="PENDING_CONFIRMATION",
+                        is_sent="",
+                        attempts=0,
+                    )},
+                    (reservation := ResultRow(
+                        receiving_number="0101",
+                        delivery_id="23456789ABCDEFGK",
+                        delivery_status="PENDING_CONFIRMATION",
+                        is_sent="",
+                        attempts=0,
+                    ),),
+                )
+
+            self.assertEqual(store.path.read_bytes(), original_bytes)
+
     def test_snapshot_attaches_seoul_to_naive_time_without_host_conversion(self):
         """Catches standalone ResultStore snapshots interpreting naive time as host-local."""
         class HostSensitiveNaive(datetime):
@@ -310,6 +392,31 @@ class ResultTests(unittest.TestCase):
 
             self.assertEqual(snapshot_path.name, "result_20260815_000102.csv")
             self.assertEqual(snapshot_path.read_bytes(), store.path.read_bytes())
+
+    def test_archive_current_preserves_exact_valid_current_bytes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = ResultStore.for_root(Path(directory))
+            store.path.parent.mkdir(parents=True)
+            payload = (
+                b"\xef\xbb\xbfreceiving_number,delivery_id,delivery_status,is_sent,"
+                b"attempts,request_id,message_id,error\r\n"
+                b"0102,ABCDEFGH23456789,SENT,true,2,r2,m2,null\r\n"
+                b"0101,23456789ABCDEFGH,SENT,true,1,r1,m1,null\r\n"
+            )
+            store.path.write_bytes(payload)
+            archive_current = getattr(store, "archive_current", None)
+            self.assertTrue(
+                callable(archive_current),
+                "ResultStore.archive_current must be available",
+            )
+
+            archive_path = archive_current(
+                datetime(2026, 8, 14, 15, 1, 2, tzinfo=timezone.utc)
+            )
+
+            self.assertEqual(archive_path.name, "result_20260815_000102.csv")
+            self.assertEqual(archive_path.read_bytes(), payload)
+            self.assertEqual(store.path.read_bytes(), payload)
 
     def test_snapshot_uses_next_suffix_without_overwriting_history(self):
         with tempfile.TemporaryDirectory() as directory:

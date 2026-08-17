@@ -26,6 +26,7 @@ def message_record():
     return MessageRecord(
         request_id="request-1",
         message_id="message-1",
+        message_type="MMS",
         to="01012345678",
         request_time="2026-08-13 10:00:00",
         complete_time="2026-08-13 10:00:30",
@@ -52,6 +53,72 @@ def serialized_message():
 
 
 class EventLogTests(unittest.TestCase):
+    def test_private_serializer_builds_the_exact_jsonl_row_before_write(self):
+        serializer = getattr(event_log, "_serialize_event_line", None)
+        self.assertTrue(callable(serializer), "_serialize_event_line must exist")
+
+        encoded = serializer(
+            now=datetime(2026, 8, 14, 3, 4, 5, 678901, tzinfo=timezone.utc),
+            sequence=3,
+            event="RESULT_SNAPSHOT_WRITTEN",
+            result_snapshot="C:/results/result_20260814_120405.csv",
+            completed_at="2026-08-14T12:04:05.678+09:00",
+        )
+
+        self.assertEqual(
+            json.loads(encoded),
+            {
+                "schema_version": 1,
+                "sequence": 3,
+                "logged_at": "2026-08-14T12:04:05.678+09:00",
+                "event": "RESULT_SNAPSHOT_WRITTEN",
+                "delivery_id": None,
+                "attempt": None,
+                "api": None,
+                "http_status": None,
+                "request_id": None,
+                "message_id": None,
+                "response": None,
+                "error": None,
+                "state": None,
+                "summary": None,
+                "completed_at": "2026-08-14T12:04:05.678+09:00",
+                "result_snapshot": "C:/results/result_20260814_120405.csv",
+            },
+        )
+
+    def test_resend_archive_event_is_path_free_and_deidentified(self):
+        """Catches the archive boundary leaking a path or correlation identifier."""
+        path = Path(tempfile.mkdtemp()) / "delivery.jsonl"
+        now = lambda: datetime(2026, 8, 14, 3, 4, 5, 678901, tzinfo=timezone.utc)
+
+        with JsonlEventLog(path, now=now) as log:
+            log.write("RESEND_ARCHIVE_WRITTEN")
+
+        row = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(row["event"], "RESEND_ARCHIVE_WRITTEN")
+        self.assertEqual(
+            {
+                key: value
+                for key, value in row.items()
+                if key not in {"schema_version", "sequence", "logged_at", "event"}
+            },
+            {
+                "delivery_id": None,
+                "attempt": None,
+                "api": None,
+                "http_status": None,
+                "request_id": None,
+                "message_id": None,
+                "response": None,
+                "error": None,
+                "state": None,
+                "summary": None,
+                "completed_at": None,
+                "result_snapshot": None,
+            },
+        )
+
     def test_total_sanitizers_never_invoke_hostile_values_across_jsonl_boundaries(self):
         """Catches response/error/state sanitizers invoking or rejecting hostile values."""
         calls = []
@@ -362,6 +429,7 @@ class EventLogTests(unittest.TestCase):
 
         self.assertEqual(actual, serialized_message())
         self.assertNotIn("to", actual)
+        self.assertNotIn("type", actual)
         self.assertNotIn("01012345678", json.dumps(actual))
 
     def test_list_response_serializer_includes_safe_envelope_and_serialized_messages(self):
@@ -655,6 +723,7 @@ class EventLogTests(unittest.TestCase):
         record = MessageRecord(
             request_id="request-correlation-unchanged",
             message_id="message-correlation-unchanged",
+            message_type="MMS",
             to="01012345678",
             request_time="2026-08-13 10:00:00",
             complete_time="2026-08-13 10:00:30",
@@ -746,6 +815,7 @@ class EventLogTests(unittest.TestCase):
         record = MessageRecord(
             request_id="request-correlation-unchanged",
             message_id="message-correlation-unchanged",
+            message_type="MMS",
             to="01012345678",
             request_time=secret,
             complete_time=secret,
@@ -806,6 +876,7 @@ class EventLogTests(unittest.TestCase):
         record = MessageRecord(
             request_id=record.request_id,
             message_id=record.message_id,
+            message_type=record.message_type,
             to=record.to,
             request_time=record.request_time,
             complete_time=record.complete_time,
@@ -857,6 +928,7 @@ class EventLogTests(unittest.TestCase):
         record = MessageRecord(
             request_id=record.request_id,
             message_id=record.message_id,
+            message_type=record.message_type,
             to=record.to,
             request_time=record.request_time,
             complete_time=record.complete_time,

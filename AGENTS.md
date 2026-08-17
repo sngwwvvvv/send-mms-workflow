@@ -2,13 +2,26 @@
 
 ## Structured result and event-log policy
 
-This policy supersedes earlier result-file location and column definitions.
+This policy defines the active integrated MMS contract.
 
 - Results live in `results/result.csv`; immutable snapshots live in `results/result_{YYYYMMDD_HHMMSS}.csv`.
 - Logs live in `logs/delivery_{YYYYMMDD_HHMMSS}.jsonl`; same-second collisions use `_001` through `_999` and never overwrite an existing file.
 - Result columns and order are exactly `receiving_number,delivery_id,delivery_status,is_sent,attempts,request_id,message_id,error`.
-- `PENDING_CONFIRMATION` with `attempts=0` is legal only for a newly assigned pre-POST reservation: it must have a non-empty delivery ID, blank request and message IDs, and `error=null`.
-- Log records use `delivery_id`, never a complete recipient number. Record every actual send/list/get response, including repeated `READY` and `PROCESSING` polls.
+- Fixed run settings are:
+
+```text
+worker_count=5
+poll_interval_seconds=1
+confirmation_timeout_seconds=120
+retry_delay_seconds=10
+max_attempts=3
+rate_limit_delays_seconds=[10,20]
+```
+
+- `SENT` means correlated `COMPLETED + success`; `FAILED` means the current approved run reached three explicit failures; `PENDING_CONFIRMATION` means the result is not yet final.
+- `PENDING_CONFIRMATION` with `attempts=0` is legal only for a newly assigned pre-POST reservation: it must have a non-empty `delivery_id`, blank request and message IDs, and `error=null`.
+- A `PENDING_CONFIRMATION` row with positive `attempts` and blank correlation IDs is ambiguous and must never be automatically reposted.
+- Logs use `delivery_id`, never a complete recipient number. Record every actual send/list/get response, including repeated `READY` and `PROCESSING` polls.
 - Never log full recipient or sender numbers, names, content, subject, file IDs, service ID, credentials, signatures, authentication headers, or raw request/response bodies.
 - API-controlled `statusMessage` and error `message` text is never stored or logged verbatim: an empty value stays empty and every non-empty value becomes the fixed literal `redacted`. Status/error codes keep only approved internal constants or one-to-four ASCII digits; every other value becomes `UNKNOWN`.
 - API-value sanitizers are total and never invoke caller-controlled `__str__`, equality, truthiness, length, iteration, or similar methods. Only exact built-in types are inspected: status codes accept exact strings or non-boolean exact integers from 0 through 9999; human messages treat only `None`, an exact empty string, exact empty list, or exact empty dict as empty. Every other message type, including subclasses and hostile objects, becomes `redacted`; every other status type becomes `UNKNOWN`.
@@ -43,13 +56,13 @@ This policy supersedes earlier result-file location and column definitions.
 
 ## 절대 안전 규칙
 
-- 승인된 Python 발송 프로그램만 필요한 자격증명을 프로세스 메모리에 적재하기 위한 목적으로 프로젝트 루트의 `.env`를 읽을 수 있다. 에이전트, 셸, 테스트는 `.env`를 직접 열거나 내용을 출력하지 않는다. 로더는 허용된 키의 존재 여부만 검증하며 비밀값을 로그, 오류, 문서 또는 `result.csv`에 기록하지 않는다.
+- 승인된 Python 발송 프로그램만 필요한 자격증명을 프로세스 메모리에 적재하기 위한 목적으로 프로젝트 루트의 `.env`를 읽을 수 있다. 에이전트, 셸, 테스트는 `.env`를 직접 열거나 내용을 출력하지 않는다. 로더는 허용된 키의 존재 여부만 검증하며 비밀값을 로그, 오류, 문서 또는 `results/result.csv`에 기록하지 않는다.
 - 매 실발송 실행 직전에 사용자의 새롭고 명시적인 승인을 받아야 한다.
 - 승인 전에 수신 건수, 마스킹된 번호 표본, 발신번호, 정확한 본문, 첨부 파일명, 이미지 검증 결과, `contentType`을 제시한다.
 - 구현, 테스트, 드라이런 또는 문서 검증을 실발송 승인으로 간주하지 않는다.
 - 테스트에서는 실제 SENS 발송 API와 실제 수신번호를 사용하지 않는다.
-- `PENDING_CONFIRMATION` 또는 접수 여부가 불확실한 번호에는 어떤 이유로도 새 발송 요청을 보내지 않는다.
-- 기존 `result.csv`를 읽고 조정하기 전에는 신규 발송을 시작하지 않는다.
+- 실제 POST 가능성이 있는 `PENDING_CONFIRMATION`이나 접수 여부가 불확실한 번호에는 어떤 이유로도 새 발송 요청을 보내지 않는다.
+- 기존 `results/result.csv`를 읽고 조정하기 전에는 신규 발송을 시작하지 않는다.
 
 ## 프로젝트 입력
 
@@ -105,7 +118,7 @@ error={"status":"VALIDATION_ERROR","message":"수신번호 검증 실패 사유"
 ## 인증과 요청 서명
 
 - Access Key, Secret Key, SENS 서비스 ID, 등록된 발신번호는 환경변수 또는 승인된 비밀 저장소에서만 읽는다.
-- 비밀값이나 생성된 서명을 코드, 문서, 테스트 데이터, 로그, 보고서 또는 `result.csv`에 기록하지 않는다.
+- 비밀값이나 생성된 서명을 코드, 문서, 테스트 데이터, 로그, 보고서 또는 `results/result.csv`에 기록하지 않는다.
 - 공식 명세에 따라 모든 API 요청마다 현재 타임스탬프와 요청 경로를 사용해 HMAC-SHA256 서명을 생성한다.
 - 시스템 시간과 API Gateway 시간 차가 인증 허용 범위를 넘지 않는지 확인한다.
 
@@ -120,16 +133,16 @@ error={"status":"VALIDATION_ERROR","message":"수신번호 검증 실패 사유"
 5. 이미지가 정확히 두 개이며 형식, 크기, 해상도 제한을 만족한다.
 6. 본문이 승인된 내용과 정확히 일치한다.
 7. `contentType`이 사용자에게 확인됐다.
-8. 기존 `result.csv`의 `SENT`, `FAILED`, `PENDING_CONFIRMATION` 상태를 조정했다.
+8. 기존 `results/result.csv`의 `SENT`, `FAILED`, `PENDING_CONFIRMATION` 상태를 조정했다.
 
 이 결과와 실제 발송 대상을 사용자에게 제시하고 해당 실행에 대한 명시적 승인을 받은 뒤에만 POST 요청을 허용한다.
 
-## MMS 발송 요청
+## MMS 요청
 
 - SENS가 한 요청에 여러 수신번호를 허용하더라도 배치 발송하지 않는다.
 - 수신번호별로 독립된 POST 요청을 만든다.
 - 각 요청의 `messages` 배열에는 `to` 한 건만 넣는다.
-- 두 이미지의 업로드된 `fileId`를 `files` 배열에 지정된 순서로 첨부한다.
+- 각 요청은 `type="MMS"`, 사전 승인된 `contentType`, `countryCode="82"`, 승인된 `MESSAGE_BODY`, subject 없음, `messages=[{"to": "<한 수신번호>"}]`, `files=[{"fileId": intro}, {"fileId": details}]` 순서를 사용한다.
 - POST API 호출 한 번을 발송 시도 한 번으로 계산한다.
 - POST 응답의 `statusCode="202"`는 요청 접수 성공일 뿐 최종 전송 성공이 아니다.
 - `202` 응답의 `requestId`를 즉시 결과 상태에 저장한다.
@@ -145,19 +158,20 @@ error={"status":"VALIDATION_ERROR","message":"수신번호 검증 실패 사유"
 | `FAILED` | 현재 승인된 발송 실행에서 명시적 실패 3회 | `false` | 별도 사용자 승인 전 금지 |
 | `PENDING_CONFIRMATION` | 접수 또는 최종 결과 미확정 | 빈 값 | 금지 |
 
-PENDING_CONFIRMATION은 실패가 아니다. `PENDING_CONFIRMATION`인 동안 `is_sent`는 빈 값으로 유지한다. PENDING_CONFIRMATION 상태에서는 신규 발송 요청을 금지한다.
+PENDING_CONFIRMATION은 실패가 아니다. `PENDING_CONFIRMATION`인 동안 `is_sent`는 빈 값으로 유지한다. `PENDING_CONFIRMATION` 상태에서는 신규 발송 요청을 금지한다.
 
 ## 폴링과 재시도 상태 머신
 
-1. 접수된 요청은 동일한 `requestId`와 `messageId`를 사용해 30초마다 결과 조회 API로 확인한다.
+1. 접수된 요청은 동일한 `requestId`와 `messageId`를 사용해 1초마다 결과 조회 API로 확인한다.
 2. `messages[].status="READY"` 또는 `PROCESSING`이면 실패로 판단하지 않고 같은 요청을 계속 조회한다.
 3. `messages[].status="COMPLETED"`이고 `messages[].statusName="success"`이면 `SENT`, `is_sent=true`, `error=null`로 확정한다.
 4. `COMPLETED`이고 `statusName="fail"`이면 명시적 실패로 처리한다. `statusCode`는 승인된 내부 상수 또는 ASCII 숫자 1~4자리만 보존하고 그 외에는 `UNKNOWN`으로 저장하며, 비어 있지 않은 `statusMessage`는 `redacted`로 저장한다.
 5. 명시적인 POST 실패 또는 `COMPLETED + fail`일 때만 다음 POST를 허용한다.
-6. 재시도 전에 30초를 기다린다.
+6. 재시도 전에 10초를 기다린다.
 7. 사용자가 승인한 한 번의 발송 실행에서 최초 발송을 포함해 수신번호당 최대 3회까지만 POST한다.
 8. 세 번째 명시적 실패 후 `FAILED`, `is_sent=false`로 확정하고 정제된 최종 상태 코드와 고정된 비식별 오류 문구를 `error`에 기록한다.
-9. 한 발송 요청이 10분 동안 종결되지 않으면 `PENDING_CONFIRMATION`으로 저장하고 해당 번호의 처리를 보류한다.
+9. 한 발송 요청이 120초 동안 종결되지 않으면 `PENDING_CONFIRMATION`으로 저장하고 해당 번호의 처리를 보류한다.
+10. 첫 HTTP 429는 실행 전체의 새 API 호출을 10초, 같은 실행의 두 번째 이후 429는 매번 20초 멈춘다. GET 429는 transient lookup이고, 메시지 POST가 명확한 HTTP 429 응답을 받은 경우만 비접수 명시적 실패로 센다.
 
 ## 모호한 요청 결과
 
@@ -168,41 +182,41 @@ PENDING_CONFIRMATION은 실패가 아니다. `PENDING_CONFIRMATION`인 동안 `i
 - POST 접수 여부를 판별할 응답이 없음
 - 결과 조회 API의 일시적 오류
 - `requestId`는 있으나 `messageId`를 아직 찾지 못함
-- `READY` 또는 `PROCESSING` 상태가 10분을 초과함
+- `READY` 또는 `PROCESSING` 상태가 120초 확인 창을 초과함
 
 이 경우 `PENDING_CONFIRMATION`으로 저장하고 재발송하지 않는다. `requestId` 또는 `messageId`가 있으면 이후 실행에서 같은 요청을 우선 조회한다. 식별자가 없는 모호한 POST는 요청 시각과 수신번호로 발송 목록을 조회하되 기존 요청을 유일하게 식별할 수 없으면 자동 재발송하지 않고 수동 확인 대상으로 보고한다.
 
-## result.csv 형식
+## results/result.csv 형식
 
-- 결과 경로는 프로젝트 루트의 `result.csv`다.
+- 결과 경로는 프로젝트 루트의 `results/result.csv`다.
 - UTF-8로 저장하고 정규화된 수신번호당 한 행을 유지한다.
 - 열 이름과 순서는 정확히 다음과 같다.
 
 ```text
-receiving_number,delivery_status,is_sent,attempts,request_id,message_id,error
+receiving_number,delivery_id,delivery_status,is_sent,attempts,request_id,message_id,error
 ```
 
-- `attempts`는 현재 사용자 승인 발송 실행에서 실제 수행한 POST 횟수다.
+- `attempts`는 현재 승인 발송 실행에서 실제 수행한 POST 횟수다.
 - `error`는 `null` 또는 `{"status":"...","message":"..."}` 형태의 JSON 문자열이다. API 제어 원문은 저장하지 않고 위 structured policy의 상태 코드 allowlist와 고정 `redacted` 문구를 적용한다.
 - `SENT`는 `is_sent=true`, `error=null`이다.
 - `FAILED`는 `is_sent=false`이며 최종 명시적 실패의 정제된 코드와 비식별 고정 문구를 `error`에 기록한다.
 - `PENDING_CONFIRMATION`은 `is_sent`는 빈 값, `error=null`이며 가능한 요청 식별자를 보존한다.
 - 모든 상태 전이 직후 결과를 갱신한다.
-- 기존 파일 손상을 막기 위해 같은 디렉터리의 임시 파일에 전체 내용을 쓴 뒤 원자적으로 `result.csv`를 교체한다.
-- 기존 `result.csv`를 무조건 초기화하거나 성공 행을 삭제하지 않는다.
+- 기존 파일 손상을 막기 위해 같은 디렉터리의 임시 파일에 전체 내용을 쓴 뒤 원자적으로 `results/result.csv`를 교체한다.
+- 기존 `results/result.csv`를 무조건 초기화하거나 성공 행을 삭제하지 않는다.
 
 ## 재실행과 별도 재발송
 
 모든 재실행은 신규 발송보다 기존 상태 조정을 먼저 수행한다.
 
-1. 기존 `result.csv`를 읽는다.
+1. 기존 `results/result.csv`를 읽는다.
 2. 모든 `PENDING_CONFIRMATION` 요청을 저장된 식별자로 다시 조회한다.
 3. 나중에 성공한 요청은 `SENT`로 갱신한다.
 4. 나중에 명시적 실패한 요청만 현재 승인 실행의 남은 횟수에 따라 재시도하거나 `FAILED`로 전환한다.
 5. 여전히 미확정인 번호는 보류하고 새 POST를 금지한다.
 6. `SENT` 번호는 항상 발송 대상에서 제외한다.
 7. 이전 실행의 `FAILED` 번호는 사용자가 대상과 새 실행을 명시적으로 승인한 경우에만 다시 보낸다.
-8. 별도 재발송 실행 전에 기존 `result.csv`를 타임스탬프가 포함된 보관 파일로 복사한다.
+8. 별도 재발송 실행 전에 기존 `results/result.csv`를 타임스탬프가 포함된 보관 파일로 복사한다.
 9. 별도 실행 대상으로 승인된 `FAILED` 번호만 `attempts=0`부터 다시 계산한다.
 10. `PENDING_CONFIRMATION` 번호의 횟수와 상태는 초기화하지 않는다.
 
@@ -210,7 +224,7 @@ receiving_number,delivery_status,is_sent,attempts,request_id,message_id,error
 
 - 수신번호와 이름을 일반 로그, 콘솔 출력, 오류 메시지 또는 완료 보고에 평문으로 노출하지 않는다.
 - 번호 표시가 필요하면 마지막 네 자리만 남기고 마스킹한다.
-- `result.csv`에는 결과 식별을 위해 정규화된 `receiving_number`를 저장할 수 있다.
+- `results/result.csv`에는 결과 식별을 위해 정규화된 `receiving_number`를 저장할 수 있다.
 - API 요청 본문 전체, 인증 헤더, 서명, Access Key, Secret Key는 로그에 남기지 않는다.
 - 사용자에게 보고하는 API 오류에서도 비밀값과 개인정보를 제거한다.
 
@@ -221,20 +235,20 @@ receiving_number,delivery_status,is_sent,attempts,request_id,message_id,error
 - `202 → PROCESSING → COMPLETED/success → SENT`
 - 첫 번째 명시적 실패 후 재시도 성공
 - 최초 발송 포함 세 번 모두 명시적 실패 후 `FAILED`
-- 10분 초과 후 `PENDING_CONFIRMATION`, 이후 재조회 성공
+- 120초 초과 후 `PENDING_CONFIRMATION`, 이후 재조회 성공
 - POST 응답 유실 또는 네트워크 타임아웃
 - 결과 조회 API의 일시적 오류
 - 재실행 시 `SENT`와 `PENDING_CONFIRMATION`의 신규 발송 차단
 - 중복 수신번호 단일 발송
 - 입력 번호와 이미지 검증 실패의 사전 차단
-- `result.csv` 복구와 원자적 교체
+- `results/result.csv` 복구와 원자적 교체
 
 작업 완료 보고에는 다음만 포함한다.
 
 - 총 대상 건수와 `SENT`, `FAILED`, `PENDING_CONFIRMATION` 건수
 - `FAILED`의 비식별화된 오류 요약
 - `PENDING_CONFIRMATION`의 후속 조회 필요 여부
-- `result.csv`의 절대 경로
+- `results/result.csv`의 절대 경로
 - 실발송 여부와 사용자 승인 시점
 
 자격증명, 서명, 전체 수신번호 목록 또는 이름은 완료 보고에 포함하지 않는다.

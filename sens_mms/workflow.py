@@ -1,20 +1,23 @@
 from __future__ import annotations
 
+from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, replace
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
-from typing import Protocol
+from typing import Protocol, Sequence
 from zoneinfo import ZoneInfo
 
-from .api import AmbiguousPostOutcome, ExplicitApiFailure, TransientLookupError
-from .event_log import (
-    list_to_log_dict,
-    message_result_to_log_dict,
-    safe_error_dict,
-    send_to_log_dict,
-)
+from .api import ExplicitApiFailure
+from .coordination import RUN_SETTINGS, RunCoordinator, RunSafetyError
+from .event_log import safe_error_dict
 from .inputs import load_recipients
-from .preflight import build_preflight
+from .pipeline import PipelineResult, RecipientPipeline
+from .preflight import (
+    ApprovedWork,
+    PreflightReport,
+    build_preflight,
+    canonical_result_state,
+)
 from .results import (
     LiveExecutionLock,
     ResultFormatError,
@@ -47,6 +50,12 @@ class ApprovalTokenMismatch(ValueError):
     pass
 
 
+@dataclass(frozen=True)
+class _ApprovedSend:
+    work: ApprovedWork
+    reconciled_row: ResultRow | None = None
+
+
 class Workflow:
     def __init__(
         self,
@@ -68,6 +77,8 @@ class Workflow:
         self.event_log = event_log
         self.delivery_id_factory = delivery_id_factory
         self.resend_failed = resend_failed
+        self.coordinator = RunCoordinator(store, event_log, clock)
+        self._pipeline: RecipientPipeline | None = None
 
     def current_token(self) -> str:
         return build_preflight(
@@ -81,14 +92,15 @@ class Workflow:
         started = False
         try:
             with LiveExecutionLock(self.store.path.parent / ".live-execution.lock"):
-                self.event_log.write("WORKFLOW_STARTED")
+                self.coordinator.write("WORKFLOW_STARTED")
                 started = True
                 return self._run_after_started(approval_token)
-        except Exception:
+        except BaseException:
+            self.coordinator.stop()
             if started:
                 try:
                     self.event_log.write("WORKFLOW_ABORTED")
-                except Exception:
+                except BaseException:
                     pass
             raise
 
@@ -102,53 +114,81 @@ class Workflow:
         if approval_token != report.approval_token:
             raise ApprovalTokenMismatch("approval token mismatch")
 
-        resend_reservations = (
-            self._prepare_resend(report) if self.resend_failed else {}
+        if self.resend_failed:
+            self._write_resend_archive(report)
+
+        self._pipeline = RecipientPipeline(
+            self.api,
+            self.coordinator,
+            report.content_type,
         )
         self._record_validation_failures()
-        pending_retries = self._reconcile_pending()
 
-        file_ids = []
-        if report.eligible_numbers or pending_retries:
-            for image in report.approved_images:
-                file_ids.append(self.api.upload_bytes(image.name, image.data))
+        reconciliation_jobs = self._prepare_reconciliation_jobs(report)
+        reconciliation_results = self._run_phase(reconciliation_jobs, ())
+        self.coordinator.raise_if_stopped()
 
-        for recipient in report.eligible_numbers:
-            reserved = resend_reservations.get(recipient)
-            if reserved is None:
-                self._send_new(recipient, file_ids)
-            else:
-                self._send_new(
-                    recipient,
-                    file_ids,
-                    delivery_id=reserved.delivery_id,
+        latest_rows = self.coordinator.read_rows()
+        reconciled = {}
+        for result in reconciliation_results:
+            number = result.row.receiving_number
+            if number in reconciled:
+                raise ResultFormatError("duplicate reconciliation result")
+            if latest_rows.get(number) != result.row:
+                raise ResultFormatError(
+                    "reconciliation result does not match current checkpoint"
                 )
-        for row in pending_retries:
-            self._schedule_retry(row, row.attempts + 1)
-            self._send_new(
-                recipient=row.receiving_number,
-                file_ids=file_ids,
-                attempts_start=row.attempts,
-                delivery_id=row.delivery_id,
-            )
+            reconciled[number] = result
 
+        send_items = []
+        for work in report.work_items:
+            if work.action in {"START_FRESH", "RESUME_RESERVATION"}:
+                send_items.append(_ApprovedSend(work))
+            elif work.action == "RECONCILE":
+                result = reconciled.get(work.receiving_number)
+                if (
+                    result is not None
+                    and result.needs_post is True
+                    and result.retry_not_before is not None
+                    and work.allow_retry_after_explicit_failure is True
+                ):
+                    send_items.append(
+                        _ApprovedSend(
+                            ApprovedWork(
+                                receiving_number=work.receiving_number,
+                                action="RETRY_EXPLICIT",
+                                allow_retry_after_explicit_failure=True,
+                                source_delivery_id=result.row.delivery_id,
+                                retry_not_before=result.retry_not_before,
+                            ),
+                            reconciled_row=result.row,
+                        )
+                    )
+
+        if send_items:
+            file_ids = self._upload_approved_images(report)
+            phase_two_jobs = self._publish_reservations(report, tuple(send_items))
+            self._run_phase(phase_two_jobs, file_ids)
+            self.coordinator.raise_if_stopped()
+
+        self.coordinator.read_rows()
+        self.coordinator.raise_if_stopped()
         completed_at = self._seoul_time(self.clock.now())
         snapshot = self.store.snapshot(completed_at).resolve()
         snapshot_rows = ResultStore(snapshot).load().values()
         counts = self._summarize(snapshot_rows)
-        self.event_log.write(
+        self.coordinator.write(
             "RESULT_SNAPSHOT_WRITTEN",
             result_snapshot=str(snapshot),
         )
-        summary_fields = {
-            "total": counts[0],
-            "sent": counts[1],
-            "failed": counts[2],
-            "pending_confirmation": counts[3],
-        }
-        self.event_log.write(
+        self.coordinator.write(
             "WORKFLOW_COMPLETED",
-            summary=summary_fields,
+            summary={
+                "total": counts[0],
+                "sent": counts[1],
+                "failed": counts[2],
+                "pending_confirmation": counts[3],
+            },
             completed_at=self._seoul_iso(completed_at),
             result_snapshot=str(snapshot),
         )
@@ -161,93 +201,320 @@ class Workflow:
             event_log=Path(self.event_log.path),
         )
 
-    def _prepare_resend(self, report):
-        fresh_rows = ResultStore(self.store.path).load()
-        for candidate in report.eligible_rows:
-            if fresh_rows.get(candidate.receiving_number) != candidate:
-                raise ResultFormatError(
-                    "resend snapshot does not match current checkpoint"
-                )
+    def _run_phase(
+        self,
+        items: Sequence[tuple[ResultRow, ApprovedWork]],
+        file_ids: Sequence[str] = (),
+    ) -> tuple[PipelineResult, ...]:
+        jobs = tuple(items)
+        if not jobs:
+            return ()
+        self.coordinator.raise_if_stopped()
+        results = []
+        errors = []
+        with ThreadPoolExecutor(max_workers=RUN_SETTINGS.worker_count) as pool:
+            futures = []
+            try:
+                for row, work in jobs:
+                    futures.append(
+                        pool.submit(self._run_one, row, work, tuple(file_ids))
+                    )
+                for future in as_completed(futures):
+                    try:
+                        results.append(future.result())
+                    except BaseException as exc:
+                        self._stop_and_cancel(futures)
+                        errors.append(exc)
+            except BaseException:
+                self._stop_and_cancel(futures)
+                raise
+        if errors:
+            primary = next(
+                (
+                    error
+                    for error in errors
+                    if not isinstance(error, (RunSafetyError, CancelledError))
+                ),
+                next(
+                    (
+                        error
+                        for error in errors
+                        if not isinstance(error, CancelledError)
+                    ),
+                    errors[0],
+                ),
+            )
+            raise primary
+        return tuple(results)
+
+    def _stop_and_cancel(self, futures) -> None:
+        self.coordinator.stop()
+        for future in futures:
+            try:
+                future.cancel()
+            except BaseException:
+                pass
+
+    def _write_resend_archive(self, report: PreflightReport) -> None:
+        self.coordinator.raise_if_stopped()
+        archived_at = self._seoul_time(self.clock.now())
+        try:
+            archive = self.store.archive_current(archived_at)
+            archived_rows = ResultStore(archive).load()
+        except BaseException:
+            self.coordinator.stop()
+            raise
+        self.coordinator.write("RESEND_ARCHIVE_WRITTEN")
+        if canonical_result_state(archived_rows.values()) != report.approved_result_state:
+            self.coordinator.stop()
+            raise ResultFormatError(
+                "approved result does not match current checkpoint"
+            )
+        self.store.rows = dict(archived_rows)
+
+    def _run_one(
+        self,
+        row: ResultRow,
+        work: ApprovedWork,
+        file_ids: Sequence[str],
+    ) -> PipelineResult:
+        pipeline = self._pipeline
+        if pipeline is None:
+            raise ResultFormatError("recipient pipeline is unavailable")
+        try:
+            return pipeline.run(row, work, tuple(file_ids))
+        except BaseException:
+            self.coordinator.stop()
+            raise
+
+    def _upload_approved_images(
+        self,
+        report: PreflightReport,
+    ) -> tuple[str, str]:
+        if len(report.approved_images) != 2:
+            raise ResultFormatError("approved image count invalid")
+        file_ids = []
+        for image in report.approved_images:
+            self.coordinator.before_api_call()
+            try:
+                file_id = self.api.upload_bytes(image.name, image.data)
+            except Exception as exc:
+                self._record_upload_failure(exc)
+                raise
+            if type(file_id) is not str or not file_id:
+                failure = ResultFormatError("attachment upload response invalid")
+                self._record_upload_failure(failure)
+                raise failure
+            file_ids.append(file_id)
+        return file_ids[0], file_ids[1]
+
+    def _record_upload_failure(self, failure: Exception) -> None:
+        http_status = None
+        if isinstance(failure, ExplicitApiFailure):
+            http_status = failure.http_status
+            if http_status == 429:
+                try:
+                    self.coordinator.record_429()
+                except Exception:
+                    pass
+        try:
+            self.coordinator.write(
+                "ATTACHMENT_UPLOAD_FAILED",
+                api="upload",
+                http_status=http_status,
+                error=safe_error_dict("UNKNOWN", "attachment upload failed"),
+            )
+        except Exception:
+            pass
+        self.coordinator.stop()
+
+    def _publish_reservations(
+        self,
+        report: PreflightReport,
+        send_items: Sequence[_ApprovedSend],
+    ) -> tuple[tuple[ResultRow, ApprovedWork], ...]:
+        items = tuple(send_items)
+        current_rows = self.coordinator.read_rows()
+        candidates = {
+            row.receiving_number: row for row in report.eligible_rows
+        }
+        expected = {}
+        seen_numbers = set()
+        for item in items:
+            work = item.work
+            number = work.receiving_number
+            if number in seen_numbers:
+                raise ResultFormatError("duplicate approved send work")
+            seen_numbers.add(number)
+            current = current_rows.get(number)
+            if work.action == "RETRY_EXPLICIT":
+                approved = item.reconciled_row
+                if approved is None or current != approved:
+                    raise ResultFormatError(
+                        "approved retry row does not match current checkpoint"
+                    )
+                expected[number] = approved
+                self._validate_approved_send_row(work, approved, candidates)
+            else:
+                expected[number] = current
+                self._validate_approved_send_row(work, current, candidates)
 
         existing_ids = collect_delivery_ids(self.store.path.parent)
-        reservations = {}
-        for candidate in report.eligible_rows:
-            row = self._new_reservation(candidate.receiving_number, existing_ids)
+        fresh_rows = {}
+        for item in items:
+            work = item.work
+            if work.action != "START_FRESH":
+                continue
+            row = self._new_reservation(work.receiving_number, existing_ids)
             existing_ids.add(row.delivery_id)
-            reservations[candidate.receiving_number] = row
+            fresh_rows[work.receiving_number] = row
 
-        publish_rows = ResultStore(self.store.path).load()
-        for candidate in report.eligible_rows:
-            if publish_rows.get(candidate.receiving_number) != candidate:
-                raise ResultFormatError(
-                    "resend snapshot does not match current checkpoint"
+        replacements = []
+        jobs = []
+        for item in items:
+            work = item.work
+            if work.action == "START_FRESH":
+                row = fresh_rows[work.receiving_number]
+                replacements.append(row)
+            elif work.action == "RETRY_EXPLICIT":
+                row = item.reconciled_row
+                if row is None:
+                    raise ResultFormatError(
+                        "approved retry row does not match current checkpoint"
+                    )
+            else:
+                row = current_rows[work.receiving_number]
+                if work.action == "RESUME_RESERVATION":
+                    replacements.append(row)
+            jobs.append((row, work))
+
+        self.coordinator.commit_batch(expected, tuple(replacements))
+        for row, work in jobs:
+            if work.action in {"START_FRESH", "RESUME_RESERVATION"}:
+                self.coordinator.write(
+                    "DELIVERY_ID_ASSIGNED",
+                    delivery_id=row.delivery_id,
                 )
-        self.store.rows = publish_rows
-        for row in reservations.values():
-            self.store.upsert(row)
-        self.store.write_atomic()
-        for row in reservations.values():
-            self.event_log.write(
+                self._log_state(row)
+            elif work.action == "RETRY_EXPLICIT":
+                self.coordinator.write(
+                    "RETRY_SCHEDULED",
+                    delivery_id=row.delivery_id,
+                    attempt=row.attempts + 1,
+                )
+        return tuple(jobs)
+
+    def _prepare_reconciliation_jobs(
+        self,
+        report: PreflightReport,
+    ) -> tuple[tuple[ResultRow, ApprovedWork], ...]:
+        current_rows = self.coordinator.read_rows()
+        approved = []
+        blank_id_rows = []
+        for work in report.work_items:
+            if work.action != "RECONCILE":
+                continue
+            row = self._approved_existing_row(current_rows, work)
+            approved.append((row, work))
+            if not row.delivery_id:
+                blank_id_rows.append((row, work))
+        if not blank_id_rows:
+            return tuple(approved)
+
+        existing_ids = collect_delivery_ids(self.store.path.parent)
+        replacements = []
+        updated = {}
+        for row, work in blank_id_rows:
+            delivery_id = self.delivery_id_factory(existing_ids)
+            if delivery_id in existing_ids:
+                raise ResultFormatError(
+                    "delivery ID generator returned duplicate data"
+                )
+            existing_ids.add(delivery_id)
+            replacement = replace(row, delivery_id=delivery_id)
+            replacement.validate()
+            replacements.append(replacement)
+            updated[row.receiving_number] = (
+                replacement,
+                ApprovedWork(
+                    receiving_number=work.receiving_number,
+                    action=work.action,
+                    allow_retry_after_explicit_failure=(
+                        work.allow_retry_after_explicit_failure
+                    ),
+                    source_delivery_id=delivery_id,
+                ),
+            )
+
+        self.coordinator.commit_batch(
+            {row.receiving_number: row for row, _ in blank_id_rows},
+            tuple(replacements),
+        )
+        for row in replacements:
+            self.coordinator.write(
                 "DELIVERY_ID_ASSIGNED",
                 delivery_id=row.delivery_id,
             )
             self._log_state(row)
-        return reservations
-
-    @staticmethod
-    def _summarize(rows):
-        rows = tuple(rows)
-        return (
-            len(rows),
-            sum(row.delivery_status == "SENT" for row in rows),
-            sum(row.delivery_status == "FAILED" for row in rows),
-            sum(row.delivery_status == "PENDING_CONFIRMATION" for row in rows),
+        return tuple(
+            updated.get(row.receiving_number, (row, work))
+            for row, work in approved
         )
 
     @staticmethod
-    def _seoul_time(value: datetime) -> datetime:
-        if value.tzinfo is None:
-            return value.replace(tzinfo=SEOUL)
-        return value.astimezone(SEOUL)
-
-    @classmethod
-    def _seoul_iso(cls, value: datetime) -> str:
-        return cls._seoul_time(value).isoformat(timespec="milliseconds")
+    def _validate_approved_send_row(work, current, candidates) -> None:
+        if work.action == "START_FRESH":
+            candidate = candidates.get(work.receiving_number)
+            if candidate is None:
+                if current is not None or work.source_delivery_id != "":
+                    raise ResultFormatError(
+                        "approved fresh row does not match current checkpoint"
+                    )
+                return
+            if (
+                current != candidate
+                or candidate.delivery_id != work.source_delivery_id
+                or candidate.delivery_status != "FAILED"
+            ):
+                raise ResultFormatError(
+                    "approved resend row does not match current checkpoint"
+                )
+            return
+        if current is None or current.delivery_id != work.source_delivery_id:
+            raise ResultFormatError(
+                "approved pending row does not match current checkpoint"
+            )
+        if work.action == "RESUME_RESERVATION":
+            legal = (
+                current.delivery_status == "PENDING_CONFIRMATION"
+                and current.is_sent == ""
+                and current.attempts == 0
+                and current.request_id == ""
+                and current.message_id == ""
+                and current.error is None
+            )
+        elif work.action == "RETRY_EXPLICIT":
+            legal = (
+                current.delivery_status == "PENDING_CONFIRMATION"
+                and current.is_sent == ""
+                and 0 < current.attempts < RUN_SETTINGS.max_attempts
+                and bool(current.request_id)
+                and bool(current.message_id)
+                and current.error is None
+                and work.allow_retry_after_explicit_failure is True
+            )
+        else:
+            legal = False
+        if not legal:
+            raise ResultFormatError("approved send action is not legal")
 
     @staticmethod
-    def _state(row: ResultRow) -> dict:
-        return {
-            "delivery_status": row.delivery_status,
-            "is_sent": row.is_sent,
-            "attempts": row.attempts,
-            "request_id": row.request_id,
-            "message_id": row.message_id,
-            "error": row.error,
-        }
-
-    def _persist(self, row: ResultRow) -> None:
-        self.store.upsert(row)
-        self.store.write_atomic()
-
-    def _log_state(self, row: ResultRow) -> None:
-        self.event_log.write(
-            "RESULT_STATE_CHANGED",
-            delivery_id=row.delivery_id,
-            state=self._state(row),
-        )
-
-    def _checkpoint(self, row: ResultRow) -> None:
-        self._persist(row)
-        self._log_state(row)
-
-    def _reserve(self, recipient: str) -> ResultRow:
-        row = self._new_reservation(
-            recipient,
-            collect_delivery_ids(self.store.path.parent),
-        )
-        self._persist(row)
-        self.event_log.write("DELIVERY_ID_ASSIGNED", delivery_id=row.delivery_id)
-        self._log_state(row)
+    def _approved_existing_row(rows, work: ApprovedWork) -> ResultRow:
+        row = rows.get(work.receiving_number)
+        if row is None or row.delivery_id != work.source_delivery_id:
+            raise ResultFormatError(
+                "approved pending row does not match current checkpoint"
+            )
         return row
 
     def _new_reservation(self, recipient: str, existing_ids) -> ResultRow:
@@ -269,305 +536,62 @@ class Workflow:
 
     def _record_validation_failures(self) -> None:
         recipients = load_recipients(self.root / "receiving_numbers.csv")
+        current_rows = self.coordinator.read_rows()
         for failure in recipients.failures:
-            self._checkpoint(
-                ResultRow(
-                    receiving_number=failure.receiving_number,
-                    delivery_id="",
-                    delivery_status="FAILED",
-                    is_sent="false",
-                    attempts=0,
-                    request_id="",
-                    message_id="",
-                    error={
-                        "status": failure.error_status,
-                        "message": failure.error_message,
-                    },
-                )
-            )
-
-    def _send_new(
-        self,
-        recipient: str,
-        file_ids: list[str],
-        attempts_start: int = 0,
-        delivery_id: str | None = None,
-    ) -> None:
-        if delivery_id is None:
-            row = self._reserve(recipient)
-        else:
             row = ResultRow(
-                receiving_number=recipient,
-                delivery_id=delivery_id,
-                delivery_status="PENDING_CONFIRMATION",
-                is_sent="",
-                attempts=attempts_start,
+                receiving_number=failure.receiving_number,
+                delivery_id="",
+                delivery_status="FAILED",
+                is_sent="false",
+                attempts=0,
                 request_id="",
                 message_id="",
-                error=None,
+                error={
+                    "status": failure.error_status,
+                    "message": failure.error_message,
+                },
             )
-
-        attempts = attempts_start
-        while attempts < 3:
-            attempts += 1
-            row = replace(
+            self.coordinator.commit(
                 row,
-                delivery_status="PENDING_CONFIRMATION",
-                is_sent="",
-                attempts=attempts,
-                request_id="",
-                message_id="",
-                error=None,
+                expected=current_rows.get(row.receiving_number),
             )
-            self._checkpoint(row)
-            self.event_log.write(
-                "SEND_ATTEMPT_STARTED",
-                delivery_id=row.delivery_id,
-                attempt=attempts,
-            )
-            started_at = self._seoul_time(self.clock.now())
-            deadline = self.clock.monotonic() + 600
-            try:
-                response = self.api.send_one(recipient, file_ids)
-            except ExplicitApiFailure as exc:
-                if attempts == 3:
-                    row = self._failed_row(row, exc)
-                    self._checkpoint(row)
-                self.event_log.write(
-                    "SEND_RESPONSE",
-                    delivery_id=row.delivery_id,
-                    attempt=attempts,
-                    api="send",
-                    http_status=exc.http_status,
-                    response=exc.response,
-                    error=safe_error_dict(exc.status, exc.message),
-                )
-                if attempts == 3:
-                    return
-                self._schedule_retry(row, attempts + 1)
-                continue
-            except AmbiguousPostOutcome:
-                self.event_log.write(
-                    "SEND_AMBIGUOUS_OUTCOME",
-                    delivery_id=row.delivery_id,
-                    attempt=attempts,
-                    api="send",
-                    error=safe_error_dict(
-                        "AMBIGUOUS_POST_OUTCOME",
-                        "send result could not be confirmed",
-                    ),
-                )
-                self._recover_ambiguous_post(row, started_at, deadline)
-                return
+            current_rows[row.receiving_number] = row
+            self._log_state(row)
 
-            row = replace(row, request_id=response.request_id)
-            self._checkpoint(row)
-            self.event_log.write(
-                "SEND_RESPONSE",
-                delivery_id=row.delivery_id,
-                attempt=row.attempts,
-                api="send",
-                http_status=response.http_status,
-                request_id=response.request_id,
-                response=send_to_log_dict(response),
-            )
-            outcome, failure, row = self._resolve_request(row, deadline)
-            if outcome in ("SENT", "PENDING_CONFIRMATION"):
-                return
-            if attempts == 3:
-                return
-            self._schedule_retry(row, attempts + 1)
-
-    def _reconcile_pending(self) -> list[ResultRow]:
-        retry_rows = []
-        rows = list(self.store.load().values())
-        for row in rows:
-            if row.delivery_status != "PENDING_CONFIRMATION":
-                continue
-            if not row.delivery_id:
-                delivery_id = self.delivery_id_factory(
-                    collect_delivery_ids(self.store.path.parent)
-                )
-                row = replace(row, delivery_id=delivery_id)
-                self._persist(row)
-                self.event_log.write(
-                    "DELIVERY_ID_ASSIGNED",
-                    delivery_id=delivery_id,
-                )
-                self._log_state(row)
-            deadline = self.clock.monotonic() + 600
-            if row.message_id:
-                outcome, failure, row = self._poll_message(row, deadline)
-            elif row.request_id:
-                outcome, failure, row = self._resolve_request(row, deadline)
-            else:
-                continue
-            if outcome == "EXPLICIT_FAILURE":
-                if row.attempts < 3:
-                    retry_rows.append(row)
-        return retry_rows
-
-    def _recover_ambiguous_post(self, row, started_at, deadline) -> None:
-        start = (started_at - timedelta(seconds=1)).strftime("%Y-%m-%d %H:%M:%S")
-        end = (
-            self._seoul_time(self.clock.now()) + timedelta(seconds=30)
-        ).strftime("%Y-%m-%d %H:%M:%S")
-        try:
-            response = self.api.list_by_time_and_recipient(
-                start, end, row.receiving_number
-            )
-        except TransientLookupError:
-            self._log_lookup_error(row, "list")
-            return
-        matches = [
-            message
-            for message in response.messages
-            if message.to == row.receiving_number and message.request_id
-        ]
-        if len(matches) == 1:
-            match = matches[0]
-            row = replace(
-                row,
-                request_id=match.request_id,
-                message_id=match.message_id,
-            )
-            self._checkpoint(row)
-        self.event_log.write(
-            "MESSAGE_LIST_RESPONSE",
+    def _log_state(self, row: ResultRow) -> None:
+        self.coordinator.write(
+            "RESULT_STATE_CHANGED",
             delivery_id=row.delivery_id,
-            attempt=row.attempts,
-            api="list",
-            http_status=response.http_status,
-            request_id=row.request_id or None,
-            message_id=row.message_id or None,
-            response=list_to_log_dict(response),
+            state=self._state(row),
         )
-        if len(matches) != 1:
-            return
-        self._resolve_request(row, deadline)
-
-    def _resolve_request(self, row, deadline):
-        while not row.message_id:
-            if self.clock.monotonic() >= deadline:
-                return "PENDING_CONFIRMATION", None, row
-            try:
-                response = self.api.list_by_request(row.request_id)
-            except TransientLookupError:
-                self._log_lookup_error(row, "list")
-                return "PENDING_CONFIRMATION", None, row
-            matches = [
-                message
-                for message in response.messages
-                if message.to == row.receiving_number
-                and message.request_id == row.request_id
-            ]
-            if len(matches) == 1 and matches[0].message_id:
-                row = replace(row, message_id=matches[0].message_id)
-                self._checkpoint(row)
-            self.event_log.write(
-                "MESSAGE_LIST_RESPONSE",
-                delivery_id=row.delivery_id,
-                attempt=row.attempts,
-                api="list",
-                http_status=response.http_status,
-                request_id=row.request_id,
-                message_id=row.message_id or None,
-                response=list_to_log_dict(response),
-            )
-            if row.message_id:
-                break
-            remaining = deadline - self.clock.monotonic()
-            if remaining <= 0:
-                return "PENDING_CONFIRMATION", None, row
-            self.clock.sleep(min(30, remaining))
-        return self._poll_message(row, deadline)
-
-    def _poll_message(self, row, deadline):
-        while self.clock.monotonic() < deadline:
-            try:
-                response = self.api.get_message(row.message_id)
-            except TransientLookupError:
-                self._log_lookup_error(row, "get")
-                return "PENDING_CONFIRMATION", None, row
-            message = response.message
-            correlated = (
-                message.request_id == row.request_id
-                and message.message_id == row.message_id
-                and message.to == row.receiving_number
-            )
-            outcome = None
-            failure = None
-            if correlated and message.status == "COMPLETED" and message.status_name == "success":
-                row = replace(
-                    row,
-                    delivery_status="SENT",
-                    is_sent="true",
-                    error=None,
-                )
-                self._checkpoint(row)
-                outcome = "SENT"
-            elif correlated and message.status == "COMPLETED" and message.status_name == "fail":
-                failure = ExplicitApiFailure(
-                    message.status_code or "UNKNOWN",
-                    message.status_message or "delivery failed",
-                )
-                if row.attempts >= 3:
-                    row = self._failed_row(row, failure)
-                    self._checkpoint(row)
-                outcome = "EXPLICIT_FAILURE"
-            elif not correlated or message.status not in ("READY", "PROCESSING"):
-                outcome = "PENDING_CONFIRMATION"
-
-            self.event_log.write(
-                "DELIVERY_POLL_RESPONSE",
-                delivery_id=row.delivery_id,
-                attempt=row.attempts,
-                api="get",
-                http_status=response.http_status,
-                request_id=row.request_id,
-                message_id=row.message_id,
-                response=message_result_to_log_dict(response),
-            )
-            if outcome is not None:
-                return outcome, failure, row
-
-            remaining = deadline - self.clock.monotonic()
-            if remaining <= 0:
-                break
-            self.clock.sleep(min(30, remaining))
-        return "PENDING_CONFIRMATION", None, row
 
     @staticmethod
-    def _failed_row(row: ResultRow, failure: ExplicitApiFailure) -> ResultRow:
-        return replace(
-            row,
-            delivery_status="FAILED",
-            is_sent="false",
-            error=safe_error_dict(failure.status, failure.message),
+    def _state(row: ResultRow) -> dict:
+        return {
+            "delivery_status": row.delivery_status,
+            "is_sent": row.is_sent,
+            "attempts": row.attempts,
+            "request_id": row.request_id,
+            "message_id": row.message_id,
+            "error": row.error,
+        }
+
+    @staticmethod
+    def _summarize(rows):
+        rows = tuple(rows)
+        return (
+            len(rows),
+            sum(row.delivery_status == "SENT" for row in rows),
+            sum(row.delivery_status == "FAILED" for row in rows),
+            sum(row.delivery_status == "PENDING_CONFIRMATION" for row in rows),
         )
 
-    def _schedule_retry(self, row: ResultRow, upcoming_attempt: int) -> None:
-        self.event_log.write(
-            "RETRY_SCHEDULED",
-            delivery_id=row.delivery_id,
-            attempt=upcoming_attempt,
-        )
-        self.clock.sleep(30)
+    @staticmethod
+    def _seoul_time(value: datetime) -> datetime:
+        if value.tzinfo is None:
+            return value.replace(tzinfo=SEOUL)
+        return value.astimezone(SEOUL)
 
-    def _log_lookup_error(
-        self,
-        row: ResultRow,
-        api: str,
-    ) -> None:
-        self.event_log.write(
-            "API_LOOKUP_ERROR",
-            delivery_id=row.delivery_id,
-            attempt=row.attempts,
-            api=api,
-            request_id=row.request_id or None,
-            message_id=row.message_id or None,
-            error=safe_error_dict(
-                "TRANSIENT_LOOKUP_ERROR",
-                "lookup temporarily unavailable",
-            ),
-        )
+    @classmethod
+    def _seoul_iso(cls, value: datetime) -> str:
+        return cls._seoul_time(value).isoformat(timespec="milliseconds")

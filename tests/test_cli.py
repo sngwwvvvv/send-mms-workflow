@@ -1,11 +1,15 @@
 import csv
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import redirect_stderr
 from datetime import datetime
 from io import StringIO
 import inspect
 import json
 from pathlib import Path
+from threading import Condition, Event, Lock, Thread
 import unittest
+from unittest.mock import patch
+from urllib.parse import parse_qs, urlparse
 from zoneinfo import ZoneInfo
 
 from sens_mms.api import ApiResponse, make_signature
@@ -63,6 +67,129 @@ class ScriptedHttpTransport:
         if isinstance(response, BaseException):
             raise response
         return response
+
+
+class RecipientRoutingTransport:
+    def __init__(self, recipients):
+        self._recipients = dict(recipients)
+        self._by_request = {
+            request_id: (number, request_id, message_id)
+            for number, (request_id, message_id) in self._recipients.items()
+        }
+        self._by_message = {
+            message_id: (number, request_id, message_id)
+            for number, (request_id, message_id) in self._recipients.items()
+        }
+        self._upload_count = 0
+        self._lock = Lock()
+        self.calls = []
+
+    def request(self, method, url, headers, body, timeout):
+        with self._lock:
+            self.calls.append((method, url, dict(headers), body, timeout))
+        parsed = urlparse(url)
+        if method == "POST" and parsed.path.endswith("/files"):
+            with self._lock:
+                self._upload_count += 1
+                file_id = FILE_1 if self._upload_count == 1 else FILE_2
+            return api_response(200, {"fileId": file_id})
+        if method == "POST" and parsed.path.endswith("/messages"):
+            payload = json.loads(body.decode("utf-8"))
+            number = payload["messages"][0]["to"]
+            request_id, _ = self._recipients[number]
+            return api_response(
+                202,
+                {
+                    "requestId": request_id,
+                    "requestTime": "2026-08-13T10:00:00.000",
+                    "statusCode": "202",
+                    "statusName": "success",
+                },
+            )
+        if method == "GET" and "requestId" in parse_qs(parsed.query):
+            request_id = parse_qs(parsed.query)["requestId"][0]
+            number, _, message_id = self._by_request[request_id]
+            return api_response(
+                200,
+                {
+                    "statusCode": "202",
+                    "statusName": "success",
+                    "pageSize": 100,
+                    "pageIndex": 0,
+                    "itemCount": 1,
+                    "hasMore": False,
+                    "messages": [
+                        official_message(number, request_id, message_id, "PROCESSING")
+                    ],
+                },
+            )
+        if method == "GET":
+            message_id = parsed.path.rsplit("/", 1)[-1]
+            number, request_id, _ = self._by_message[message_id]
+            return api_response(
+                200,
+                {
+                    "statusCode": "200",
+                    "statusName": "success",
+                    "messages": [
+                        official_message(
+                            number,
+                            request_id,
+                            message_id,
+                            "COMPLETED",
+                            status_name="success",
+                            status_code="0",
+                            status_message="success",
+                        )
+                    ],
+                },
+            )
+        raise AssertionError("unexpected network call")
+
+
+class FiveWorkerGateTransport(RecipientRoutingTransport):
+    def __init__(self, recipients):
+        super().__init__(recipients)
+        self._condition = Condition()
+        self._released = False
+        self.entered_message_recipients = []
+
+    def request(self, method, url, headers, body, timeout):
+        parsed = urlparse(url)
+        if not (method == "POST" and parsed.path.endswith("/messages")):
+            return super().request(method, url, headers, body, timeout)
+
+        with self._lock:
+            self.calls.append((method, url, dict(headers), body, timeout))
+        payload = json.loads(body.decode("utf-8"))
+        number = payload["messages"][0]["to"]
+        with self._condition:
+            self.entered_message_recipients.append(number)
+            self._condition.notify_all()
+            if not self._condition.wait_for(lambda: self._released, timeout=5):
+                raise AssertionError("message POST gate was not released")
+        request_id, _ = self._recipients[number]
+        return api_response(
+            202,
+            {
+                "requestId": request_id,
+                "requestTime": "2026-08-13T10:00:00.000",
+                "statusCode": "202",
+                "statusName": "success",
+            },
+        )
+
+    def wait_for_message_entries(self, count, *, timeout=5):
+        with self._condition:
+            return self._condition.wait_for(
+                lambda: len(self.entered_message_recipients) >= count,
+                timeout=timeout,
+            )
+
+    def release_message_posts(self):
+        with self._condition:
+            self._released = True
+            self._condition.notify_all()
 
 
 class FixedIdFactory:
@@ -473,10 +600,21 @@ class CliTests(unittest.TestCase):
         self.assertEqual(len(snapshots), 1)
         self.assertEqual(len(logs), 1)
         self.assertEqual(Path(public["result_csv"]), current.resolve())
-        self.assertEqual(Path(public["result_snapshot"]), snapshots[0].resolve())
-        self.assertEqual(Path(public["event_log"]), logs[0].resolve())
-        self.assertTrue(Path(public["result_snapshot"]).is_absolute())
-        self.assertTrue(Path(public["event_log"]).is_absolute())
+        self.assertTrue(Path(public["result_csv"]).is_absolute())
+        self.assertEqual(
+            set(public),
+            {
+                "total",
+                "sent",
+                "failed",
+                "pending_confirmation",
+                "failed_error_summary",
+                "pending_follow_up_required",
+                "result_csv",
+                "live_send",
+                "approved_at",
+            },
+        )
         events = [json.loads(line) for line in logs[0].read_text(encoding="utf-8").splitlines()]
         self.assertTrue(events)
         self.assertEqual(public["approved_at"], "2026-08-13T10:00:00.000+09:00")
@@ -498,8 +636,48 @@ class CliTests(unittest.TestCase):
         self.assert_public_safe(public)
         self.assertNotIn(RECIPIENT, rendered)
 
+        message_posts = [
+            call
+            for call in transport.calls
+            if call[0] == "POST" and urlparse(call[1]).path.endswith("/messages")
+        ]
+        self.assertEqual(len(message_posts), 1)
+        payload = json.loads(message_posts[0][3].decode("utf-8"))
+        self.assertEqual(payload["content"].encode("utf-8"), MESSAGE_BODY.encode("utf-8"))
+        self.assertEqual(payload["contentType"], "COMM")
+        self.assertEqual(payload["messages"], [{"to": RECIPIENT}])
+        self.assertEqual(payload["files"], [{"fileId": FILE_1}, {"fileId": FILE_2}])
+        self.assertNotIn("subject", payload)
+
     def test_preflight_creates_no_event_log_and_never_calls_network(self):
-        root = make_root()
+        root = make_root((RECIPIENT, SECOND))
+        (root / "receiving_numbers.csv").write_text(
+            f"number,name\n{FORMATTED_RECIPIENT},{NAME}\n{SECOND},Second Private Name\n",
+            encoding="utf-8",
+        )
+        store = ResultStore.for_root(root)
+        store.upsert(
+            ResultRow(
+                receiving_number=RECIPIENT,
+                delivery_id=PENDING_ID,
+                delivery_status="PENDING_CONFIRMATION",
+                is_sent="",
+                attempts=1,
+                request_id=REQUEST_1,
+                message_id=MESSAGE_1,
+                error=None,
+            )
+        )
+        store.upsert(
+            failed_row(
+                SECOND,
+                OLD_ID_2,
+                REQUEST_2,
+                MESSAGE_2,
+                message="redacted",
+            )
+        )
+        store.write_atomic()
         transport = ScriptedHttpTransport()
         tracker = FactoryTracker()
 
@@ -512,6 +690,165 @@ class CliTests(unittest.TestCase):
         self.assertEqual(transport.calls, [])
         self.assertEqual(tracker.calls, [])
         self.assertFalse((root / "logs").exists())
+        self.assertEqual(public["sender"], ENV["NCP_SENS_FROM_NUMBER"])
+        self.assertEqual(public["body"].encode("utf-8"), MESSAGE_BODY.encode("utf-8"))
+        self.assertEqual(public["contentType"], "COMM")
+        self.assertEqual(
+            public["settings"],
+            {
+                "worker_count": 5,
+                "poll_interval_seconds": 1,
+                "confirmation_timeout_seconds": 120,
+                "retry_delay_seconds": 10,
+                "max_attempts": 3,
+                "rate_limit_delays_seconds": [10, 20],
+            },
+        )
+        rendered = json.dumps(public, ensure_ascii=False)
+        for forbidden in (
+            RECIPIENT,
+            SECOND,
+            FORMATTED_RECIPIENT,
+            NAME,
+            "Second Private Name",
+            PENDING_ID,
+            OLD_ID_2,
+            REQUEST_1,
+            REQUEST_2,
+            MESSAGE_1,
+            MESSAGE_2,
+            ENV["NCP_ACCESS_KEY_ID"],
+            ENV["NCP_SECRET_KEY"],
+            ENV["NCP_SENS_SERVICE_ID"],
+        ):
+            self.assertNotIn(forbidden, rendered)
+
+    def test_named_recipient_live_completion_excludes_real_boundary_sentinels(self):
+        """Catches completion copying named input, durable IDs, or sanitized API prose."""
+        root = make_root()
+        (root / "receiving_numbers.csv").write_text(
+            f"number,name\n{FORMATTED_RECIPIENT},{NAME}\n",
+            encoding="utf-8",
+        )
+        token = approval_token(root)
+        raw_api_prose = "carrier-private-status-detail"
+        processing = official_message(
+            RECIPIENT,
+            REQUEST_1,
+            MESSAGE_1,
+            "PROCESSING",
+            status_message=raw_api_prose,
+        )
+        completed = official_message(
+            RECIPIENT,
+            REQUEST_1,
+            MESSAGE_1,
+            "COMPLETED",
+            status_name="success",
+            status_code="0",
+            status_message=raw_api_prose,
+        )
+        transport = ScriptedHttpTransport(
+            [
+                api_response(200, {"fileId": FILE_1}),
+                api_response(200, {"fileId": FILE_2}),
+                api_response(
+                    202,
+                    {
+                        "requestId": REQUEST_1,
+                        "requestTime": "2026-08-13T10:00:00.000",
+                        "statusCode": "202",
+                        "statusName": "success",
+                    },
+                ),
+                api_response(
+                    200,
+                    {
+                        "statusCode": "202",
+                        "statusName": "success",
+                        "pageSize": 100,
+                        "pageIndex": 0,
+                        "itemCount": 1,
+                        "hasMore": False,
+                        "messages": [processing],
+                    },
+                ),
+                api_response(
+                    200,
+                    {
+                        "statusCode": "200",
+                        "statusName": "success",
+                        "messages": [completed],
+                    },
+                ),
+            ]
+        )
+
+        code, public, _ = run_cli(
+            ["live", "--approval-token", token, "--confirm-sender-registered"],
+            root,
+            transport=transport,
+            delivery_id_factory=FixedIdFactory(NEW_ID_1),
+        )
+
+        rendered = json.dumps(public, ensure_ascii=False)
+        signature = make_signature(
+            "POST",
+            f"/sms/v2/services/{ENV['NCP_SENS_SERVICE_ID']}/messages",
+            "1700000000000",
+            ENV["NCP_ACCESS_KEY_ID"],
+            ENV["NCP_SECRET_KEY"],
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            set(public),
+            {
+                "total",
+                "sent",
+                "failed",
+                "pending_confirmation",
+                "failed_error_summary",
+                "pending_follow_up_required",
+                "result_csv",
+                "live_send",
+                "approved_at",
+            },
+        )
+        for forbidden in (
+            RECIPIENT,
+            FORMATTED_RECIPIENT,
+            NAME,
+            ENV["NCP_SENS_FROM_NUMBER"],
+            MESSAGE_BODY,
+            NEW_ID_1,
+            REQUEST_1,
+            MESSAGE_1,
+            ENV["NCP_ACCESS_KEY_ID"],
+            ENV["NCP_SECRET_KEY"],
+            ENV["NCP_SENS_SERVICE_ID"],
+            signature,
+            raw_api_prose,
+            "result_snapshot",
+            "event_log",
+        ):
+            self.assertNotIn(forbidden, rendered)
+
+    def test_cli_has_no_runtime_concurrency_or_timing_options(self):
+        root = make_root()
+        for option in (
+            "--workers",
+            "--poll-interval",
+            "--confirmation-timeout",
+            "--retry-delay",
+            "--rate-limit-delay",
+        ):
+            with self.subTest(option=option):
+                transport = ScriptedHttpTransport()
+                code, public, _ = run_cli(
+                    ["preflight", option, "99"], root, transport=transport
+                )
+                self.assertEqual((code, public), (2, BLOCKED))
+                self.assertEqual(transport.calls, [])
 
     def test_wrong_token_and_missing_sender_confirmation_create_no_log_or_calls(self):
         for argv in (
@@ -533,6 +870,280 @@ class CliTests(unittest.TestCase):
                 self.assertEqual(tracker.calls, [])
                 self.assertFalse((root / "logs").exists())
                 self.assert_public_safe(public, "wrong", "irrelevant")
+
+    def test_pending_only_success_reconciles_without_image_upload_or_message_post(self):
+        root = make_root()
+        row = ResultRow(
+            receiving_number=RECIPIENT,
+            delivery_id=PENDING_ID,
+            delivery_status="PENDING_CONFIRMATION",
+            is_sent="",
+            attempts=1,
+            request_id=REQUEST_1,
+            message_id=MESSAGE_1,
+            error=None,
+        )
+        store = ResultStore.for_root(root)
+        store.upsert(row)
+        store.write_atomic()
+        token = approval_token(root)
+        transport = ScriptedHttpTransport(
+            [
+                api_response(
+                    200,
+                    {
+                        "statusCode": "200",
+                        "statusName": "success",
+                        "messages": [
+                            official_message(
+                                RECIPIENT,
+                                REQUEST_1,
+                                MESSAGE_1,
+                                "COMPLETED",
+                                status_name="success",
+                                status_code="0",
+                            )
+                        ],
+                    },
+                )
+            ]
+        )
+
+        code, public, _ = run_cli(
+            ["live", "--approval-token", token, "--confirm-sender-registered"],
+            root,
+            transport=transport,
+        )
+
+        current = ResultStore.for_root(root).load()[RECIPIENT]
+        self.assertEqual(code, 0)
+        self.assertEqual(current.delivery_status, "SENT")
+        self.assertEqual((public["sent"], public["pending_confirmation"]), (1, 0))
+        self.assertEqual(len(transport.calls), 1)
+        self.assertEqual(transport.calls[0][0], "GET")
+
+    def test_attempts_zero_reservation_resumes_same_id_with_integrated_mms(self):
+        root = make_root()
+        store = ResultStore.for_root(root)
+        store.upsert(pending_reservation(RECIPIENT))
+        store.write_atomic()
+        token = approval_token(root)
+        transport = ScriptedHttpTransport(success_responses())
+
+        code, public, _ = run_cli(
+            ["live", "--approval-token", token, "--confirm-sender-registered"],
+            root,
+            transport=transport,
+            delivery_id_factory=FixedIdFactory(NEW_ID_1),
+        )
+
+        current = ResultStore.for_root(root).load()[RECIPIENT]
+        self.assertEqual(code, 0)
+        self.assertEqual(current.delivery_id, PENDING_ID)
+        self.assertEqual((current.delivery_status, current.attempts), ("SENT", 1))
+        self.assertEqual((public["sent"], public["pending_confirmation"]), (1, 0))
+
+    def test_positive_attempt_blank_ids_remain_held_without_network_calls(self):
+        root = make_root()
+        store = ResultStore.for_root(root)
+        store.upsert(
+            ResultRow(
+                receiving_number=RECIPIENT,
+                delivery_id="",
+                delivery_status="PENDING_CONFIRMATION",
+                is_sent="",
+                attempts=1,
+                request_id="",
+                message_id="",
+                error=None,
+            )
+        )
+        store.write_atomic()
+        token = approval_token(root)
+        transport = ScriptedHttpTransport()
+
+        code, public, _ = run_cli(
+            ["live", "--approval-token", token, "--confirm-sender-registered"],
+            root,
+            transport=transport,
+        )
+
+        current = ResultStore.for_root(root).load()[RECIPIENT]
+        self.assertEqual(code, 0)
+        self.assertEqual(current.attempts, 1)
+        self.assertEqual(current.request_id, "")
+        self.assertEqual((public["pending_confirmation"], transport.calls), (1, []))
+
+    def test_pending_explicit_failure_conditionally_uploads_then_retries_once(self):
+        root = make_root()
+        store = ResultStore.for_root(root)
+        store.upsert(
+            ResultRow(
+                receiving_number=RECIPIENT,
+                delivery_id=PENDING_ID,
+                delivery_status="PENDING_CONFIRMATION",
+                is_sent="",
+                attempts=1,
+                request_id=REQUEST_1,
+                message_id=MESSAGE_1,
+                error=None,
+            )
+        )
+        store.write_atomic()
+        token = approval_token(root)
+        failed = official_message(
+            RECIPIENT,
+            REQUEST_1,
+            MESSAGE_1,
+            "COMPLETED",
+            status_name="fail",
+            status_code="3001",
+            status_message="private failure detail",
+        )
+        transport = ScriptedHttpTransport(
+            [
+                api_response(
+                    200,
+                    {
+                        "statusCode": "200",
+                        "statusName": "success",
+                        "messages": [failed],
+                    },
+                ),
+                *success_responses(RECIPIENT, REQUEST_2, MESSAGE_2),
+            ]
+        )
+
+        code, public, _ = run_cli(
+            ["live", "--approval-token", token, "--confirm-sender-registered"],
+            root,
+            transport=transport,
+        )
+
+        current = ResultStore.for_root(root).load()[RECIPIENT]
+        self.assertEqual(code, 0)
+        self.assertEqual((current.delivery_status, current.attempts), ("SENT", 2))
+        self.assertEqual(current.delivery_id, PENDING_ID)
+        self.assertEqual(len(transport.calls), 6)
+        self.assertEqual(
+            [
+                urlparse(call[1]).path.rsplit("/", 1)[-1]
+                for call in transport.calls
+                if urlparse(call[1]).path.endswith("/files")
+            ],
+            ["files", "files"],
+        )
+        self.assert_public_safe(public, "private failure detail")
+
+    def test_upload_429_is_not_retried_and_starts_no_message_post(self):
+        root = make_root()
+        token = approval_token(root)
+        transport = ScriptedHttpTransport(
+            [api_response(429, {"status": {"code": "429", "message": "private"}})]
+        )
+
+        code, public, _ = run_cli(
+            ["live", "--approval-token", token, "--confirm-sender-registered"],
+            root,
+            transport=transport,
+            delivery_id_factory=FixedIdFactory(NEW_ID_1),
+        )
+
+        self.assertEqual((code, public), (2, BLOCKED))
+        self.assertEqual(len(transport.calls), 1)
+        self.assertTrue(urlparse(transport.calls[0][1]).path.endswith("/files"))
+        self.assertEqual(
+            [
+                call
+                for call in transport.calls
+                if call[0] == "POST" and urlparse(call[1]).path.endswith("/messages")
+            ],
+            [],
+        )
+
+    def test_seven_recipients_use_fixed_five_worker_contract_and_one_post_each(self):
+        """Catches any executor bound other than five while using real workers."""
+        numbers = tuple(f"0100000000{index}" for index in range(1, 8))
+        root = make_root(numbers)
+        token = approval_token(root)
+        transport = FiveWorkerGateTransport(
+            {
+                number: (f"request-{index}", f"message-{index}")
+                for index, number in enumerate(numbers, start=1)
+            }
+        )
+        ids = tuple(str(index) * 16 for index in range(2, 9))
+
+        outcome = {}
+        finished = Event()
+        executor_constructed = Event()
+        observed_max_workers = []
+        real_executor = ThreadPoolExecutor
+
+        def recording_executor(max_workers=None, *args, **kwargs):
+            observed_max_workers.append(max_workers)
+            executor_constructed.set()
+            return real_executor(max_workers, *args, **kwargs)
+
+        def invoke_cli():
+            try:
+                outcome["result"] = run_cli(
+                    [
+                        "live",
+                        "--approval-token",
+                        token,
+                        "--confirm-sender-registered",
+                    ],
+                    root,
+                    transport=transport,
+                    delivery_id_factory=FixedIdFactory(*ids),
+                )
+            finally:
+                finished.set()
+
+        cli_thread = Thread(target=invoke_cli, name="seven-recipient-cli-test")
+        constructed = False
+        five_entered = False
+        entered_count = None
+        finished_while_blocked = None
+        probe_error = None
+        try:
+            with patch("sens_mms.workflow.ThreadPoolExecutor", recording_executor):
+                cli_thread.start()
+                constructed = executor_constructed.wait(timeout=5)
+                if constructed and observed_max_workers == [5]:
+                    five_entered = transport.wait_for_message_entries(5)
+                    entered_count = len(transport.entered_message_recipients)
+                    finished_while_blocked = finished.is_set()
+        except BaseException as exc:
+            probe_error = exc
+        finally:
+            transport.release_message_posts()
+            if cli_thread.ident is not None:
+                cli_thread.join(timeout=5)
+        self.assertFalse(cli_thread.is_alive(), "CLI worker test did not finish")
+        if probe_error is not None:
+            raise probe_error
+        self.assertTrue(constructed, "real executor construction was not observed")
+        self.assertEqual(observed_max_workers, [5])
+        self.assertTrue(five_entered, "five message POSTs did not reach the closed gate")
+        self.assertEqual(entered_count, 5)
+        self.assertFalse(finished_while_blocked)
+        code, public, _ = outcome["result"]
+
+        message_posts = [
+            call
+            for call in transport.calls
+            if call[0] == "POST" and urlparse(call[1]).path.endswith("/messages")
+        ]
+        payloads = [json.loads(call[3].decode("utf-8")) for call in message_posts]
+        self.assertEqual(code, 0)
+        self.assertEqual((public["total"], public["sent"]), (7, 7))
+        self.assertEqual(len(payloads), 7)
+        self.assertEqual(
+            {payload["messages"][0]["to"] for payload in payloads}, set(numbers)
+        )
+        self.assertTrue(all(len(payload["messages"]) == 1 for payload in payloads))
 
     def test_event_log_creation_failure_makes_zero_calls_and_prints_fixed_blocked_output(self):
         root = make_root()
@@ -557,11 +1168,14 @@ class CliTests(unittest.TestCase):
         self.assert_public_safe(public)
 
     def test_event_log_mid_run_failure_stops_later_recipient_and_keeps_accepted_pending(self):
+        """Catches posted/unposted atomic reservations persisting the wrong API boundary."""
         root = make_root((RECIPIENT, SECOND))
         token = approval_token(root)
-        transport = ScriptedHttpTransport(
-            success_responses()
-            + recipient_success_responses(SECOND, REQUEST_2, MESSAGE_2)
+        transport = RecipientRoutingTransport(
+            {
+                RECIPIENT: (REQUEST_1, MESSAGE_1),
+                SECOND: (REQUEST_2, MESSAGE_2),
+            }
         )
 
         def failing_factory(logs_dir, started_at, *, now):
@@ -580,17 +1194,51 @@ class CliTests(unittest.TestCase):
         rows = ResultStore.for_root(root).load()
         self.assertNotEqual(code, 0)
         self.assertEqual(public, BLOCKED)
-        self.assertEqual(len(transport.calls), 3)
-        self.assertEqual(set(rows), {RECIPIENT})
-        self.assertEqual(rows[RECIPIENT].delivery_status, "PENDING_CONFIRMATION")
-        self.assertEqual(rows[RECIPIENT].request_id, REQUEST_1)
+        upload_calls = [
+            call for call in transport.calls if urlparse(call[1]).path.endswith("/files")
+        ]
+        send_calls = [
+            call
+            for call in transport.calls
+            if call[0] == "POST" and urlparse(call[1]).path.endswith("/messages")
+        ]
+        lookup_calls = [call for call in transport.calls if call[0] == "GET"]
+        self.assertEqual(len(upload_calls), 2)
+        self.assertGreaterEqual(len(send_calls), 1)
+        self.assertLessEqual(len(send_calls), 2)
+        sent_numbers = [
+            json.loads(call[3].decode("utf-8"))["messages"][0]["to"]
+            for call in send_calls
+        ]
+        self.assertEqual(len(sent_numbers), len(set(sent_numbers)))
+        self.assertEqual(lookup_calls, [])
+        self.assertEqual(set(rows), {RECIPIENT, SECOND})
+        expected_requests = {RECIPIENT: REQUEST_1, SECOND: REQUEST_2}
+        posted = set(sent_numbers)
+        for number, row in rows.items():
+            self.assertEqual(row.delivery_status, "PENDING_CONFIRMATION")
+            self.assertEqual(row.is_sent, "")
+            self.assertIsNone(row.error)
+            if number in posted:
+                self.assertEqual(row.attempts, 1)
+                self.assertEqual(row.request_id, expected_requests[number])
+                self.assertEqual(row.message_id, "")
+            else:
+                self.assertEqual(row.attempts, 0)
+                self.assertEqual(row.request_id, "")
+                self.assertEqual(row.message_id, "")
         self.assertEqual(list((root / "results").glob("result_*.csv")), [])
         self.assert_public_safe(public)
 
     def test_close_failure_after_success_blocks_completion(self):
         root = make_root()
         token = approval_token(root)
-        transport = ScriptedHttpTransport(success_responses())
+        transport = RecipientRoutingTransport(
+            {
+                RECIPIENT: (REQUEST_1, MESSAGE_1),
+                SECOND: (REQUEST_2, MESSAGE_2),
+            }
+        )
 
         def close_failing_factory(logs_dir, started_at, *, now):
             return CloseFailingLog(create_event_log(logs_dir, started_at, now=now))
@@ -611,7 +1259,12 @@ class CliTests(unittest.TestCase):
     def test_close_failure_during_run_failure_does_not_expose_either_exception(self):
         root = make_root((RECIPIENT, SECOND))
         token = approval_token(root)
-        transport = ScriptedHttpTransport(success_responses())
+        transport = RecipientRoutingTransport(
+            {
+                RECIPIENT: (REQUEST_1, MESSAGE_1),
+                SECOND: (REQUEST_2, MESSAGE_2),
+            }
+        )
 
         def doubly_failing_factory(logs_dir, started_at, *, now):
             return FailOnSendResponseLog(
@@ -629,7 +1282,15 @@ class CliTests(unittest.TestCase):
 
         self.assertNotEqual(code, 0)
         self.assertEqual(public, BLOCKED)
-        self.assertEqual(len(transport.calls), 3)
+        send_calls = [
+            call
+            for call in transport.calls
+            if call[0] == "POST" and urlparse(call[1]).path.endswith("/messages")
+        ]
+        lookup_calls = [call for call in transport.calls if call[0] == "GET"]
+        self.assertGreaterEqual(len(send_calls), 1)
+        self.assertLessEqual(len(send_calls), 2)
+        self.assertEqual(lookup_calls, [])
         self.assert_public_safe(public, "secondary close secret")
 
     def test_resend_preflight_selects_filename_latest_snapshot_with_exact_count_and_zero_calls(self):
@@ -656,10 +1317,13 @@ class CliTests(unittest.TestCase):
         root, _, _, original_rows = seed_resend_root()
         before = {row.receiving_number: row for row in original_rows}
         token = approval_token(root, resend_failed=True)
-        transport = ScriptedHttpTransport(
-            [api_response(200, {"fileId": FILE_1}), api_response(200, {"fileId": FILE_2})]
-            + recipient_success_responses(RECIPIENT, "new-request-1", "new-message-1")
-            + recipient_success_responses(SECOND, "new-request-2", "new-message-2")
+        resume_number = "01033334444"
+        transport = RecipientRoutingTransport(
+            {
+                RECIPIENT: ("new-request-1", "new-message-1"),
+                SECOND: ("new-request-2", "new-message-2"),
+                resume_number: ("resume-request", "resume-message"),
+            }
         )
 
         code, public, _ = run_cli(
@@ -679,11 +1343,34 @@ class CliTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(after[RECIPIENT].delivery_id, NEW_ID_1)
         self.assertEqual(after[SECOND].delivery_id, NEW_ID_2)
+        self.assertEqual(after[resume_number].delivery_id, PENDING_ID)
+        self.assertEqual(after[resume_number].delivery_status, "SENT")
+        self.assertEqual(after[resume_number].attempts, 1)
         self.assertTrue({OLD_ID_1, OLD_ID_2}.isdisjoint({NEW_ID_1, NEW_ID_2}))
-        for number in ("01011112222", "01033334444", "not-a-number", "01055556666"):
+        for number in ("01011112222", "not-a-number", "01055556666"):
             self.assertEqual(after[number], before[number])
-        self.assertEqual(len(transport.calls), 8)
-        self.assert_public_safe(public, "new-request-1", "new-message-1", "new-request-2", "new-message-2")
+        self.assertEqual(len(transport.calls), 11)
+        message_posts = [
+            call
+            for call in transport.calls
+            if call[0] == "POST" and urlparse(call[1]).path.endswith("/messages")
+        ]
+        self.assertEqual(
+            {
+                json.loads(call[3].decode("utf-8"))["messages"][0]["to"]
+                for call in message_posts
+            },
+            {RECIPIENT, SECOND, resume_number},
+        )
+        self.assert_public_safe(
+            public,
+            "new-request-1",
+            "new-message-1",
+            "new-request-2",
+            "new-message-2",
+            "resume-request",
+            "resume-message",
+        )
 
     def test_resend_live_rejects_stale_normal_token_before_log_or_network(self):
         root, _, _, _ = seed_resend_root()
@@ -968,15 +1655,12 @@ class CliTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(observed_now[0].tzinfo, ZoneInfo("Asia/Seoul"))
         self.assertEqual(observed_now[0].isoformat(), "2026-08-13T10:00:00+09:00")
-        self.assertEqual(
-            Path(public["result_snapshot"]).name,
-            "result_20260813_100000.csv",
-        )
+        snapshots = list((root / "results").glob("result_*.csv"))
+        logs = list((root / "logs").glob("delivery_*.jsonl"))
+        self.assertEqual([path.name for path in snapshots], ["result_20260813_100000.csv"])
         log_rows = [
             json.loads(line)
-            for line in Path(public["event_log"])
-            .read_text(encoding="utf-8")
-            .splitlines()
+            for line in logs[0].read_text(encoding="utf-8").splitlines()
         ]
         self.assertTrue(all(row["logged_at"].endswith("+09:00") for row in log_rows))
 

@@ -7,7 +7,7 @@ import json
 import socket
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Mapping, Protocol
+from typing import Callable, Mapping, Protocol, Sequence
 from urllib.error import HTTPError
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
@@ -43,6 +43,7 @@ class MessageRecord:
     status_code: str
     status_name: str
     status_message: str
+    message_type: str = ""
 
 
 @dataclass(frozen=True)
@@ -112,7 +113,7 @@ class ExplicitApiFailure(SensApiError):
     ):
         self.status = str(status)
         self.message = str(message)
-        self.http_status = http_status
+        self.http_status = http_status if type(http_status) is int else None
         self.response = {}
         super().__init__(f"SENS request failed ({self.status}): {self.message}")
 
@@ -122,7 +123,9 @@ class AmbiguousPostOutcome(SensApiError):
 
 
 class TransientLookupError(SensApiError):
-    pass
+    def __init__(self, message: str, *, http_status: int | None = None):
+        self.http_status = http_status if type(http_status) is int else None
+        super().__init__(message)
 
 
 def make_signature(
@@ -211,6 +214,11 @@ class SensClient:
             data = json.loads(response.body.decode("utf-8")) if response.body else {}
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             if response.status < 200 or response.status >= 300:
+                if method == "GET":
+                    raise TransientLookupError(
+                        "SENS lookup was not successful",
+                        http_status=response.status,
+                    ) from exc
                 raise ExplicitApiFailure(
                     str(response.status),
                     "HTTP request failed with an unreadable response",
@@ -228,6 +236,11 @@ class SensClient:
                 "INVALID_RESPONSE", "attachment response was unreadable"
             ) from exc
         if response.status < 200 or response.status >= 300:
+            if method == "GET":
+                raise TransientLookupError(
+                    "SENS lookup was not successful",
+                    http_status=response.status,
+                )
             raise ExplicitApiFailure(
                 response.status,
                 "HTTP request failed",
@@ -266,21 +279,11 @@ class SensClient:
             raise ExplicitApiFailure("INVALID_RESPONSE", "fileId was not returned")
         return file_id
 
-    def send_one(
-        self, to: str, file_ids: list[str] | tuple[str, ...]
-    ) -> SendResponse:
+    def _send_message(self, payload: dict) -> SendResponse:
         http_status, data = self._request_json(
             "POST",
             self._messages_uri,
-            {
-                "type": "MMS",
-                "contentType": "COMM",
-                "countryCode": "82",
-                "from": self._from_number,
-                "content": MESSAGE_BODY,
-                "messages": [{"to": to}],
-                "files": [{"fileId": file_id} for file_id in file_ids],
-            },
+            payload,
             ambiguous_message_post=True,
         )
         status_code = data.get("statusCode")
@@ -312,18 +315,45 @@ class SensClient:
             status_name=_exact_string(data.get("statusName")),
         )
 
+    def send_one(
+        self,
+        to: str,
+        file_ids: Sequence[str],
+        *,
+        content_type: str,
+    ) -> SendResponse:
+        if type(content_type) is not str or content_type not in {"COMM", "AD"}:
+            raise ExplicitApiFailure("INVALID_REQUEST", "content type is invalid")
+        return self._send_message(
+            {
+                "type": "MMS",
+                "contentType": content_type,
+                "countryCode": "82",
+                "from": self._from_number,
+                "content": MESSAGE_BODY,
+                "messages": [{"to": to}],
+                "files": [{"fileId": file_id} for file_id in file_ids],
+            }
+        )
+
     def list_by_request(self, request_id: str) -> MessageListResponse:
         query = urlencode({"requestId": request_id})
         return self._list_messages(query)
 
     def list_by_time_and_recipient(
-        self, request_start_time: str, request_end_time: str, to: str
+        self,
+        request_start_time: str,
+        request_end_time: str,
+        to: str,
+        *,
+        message_type: str = "MMS",
     ) -> MessageListResponse:
         query = urlencode(
             {
                 "requestStartTime": request_start_time,
                 "requestEndTime": request_end_time,
                 "to": to,
+                "type": message_type,
             }
         )
         return self._list_messages(query)
@@ -397,4 +427,5 @@ def _message_record(data: dict) -> MessageRecord:
         status_code=_exact_string(data.get("statusCode")),
         status_name=_exact_string(data.get("statusName")),
         status_message=_exact_string(data.get("statusMessage")),
+        message_type=_exact_string(data.get("type")),
     )

@@ -1,7 +1,8 @@
 # LMS→MMS 실험 worktree 운영 정책
 
 작성일: 2026-08-16
-상태: 적용
+상태: 대체됨
+대체 문서: `2026-08-17-sens-mms-worker-experiment-worktree-policy.md`
 
 ## 목적
 
