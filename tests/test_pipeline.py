@@ -1096,7 +1096,7 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(api.calls, [])
 
     def test_split_dispatch_two_stage_success(self):
-        """Verify that split dispatch sends empty MMS, then resets attempts, then sends LMS with content."""
+        """Verify that split dispatch uses the split-mode MMS and LMS payload contract."""
         api = ScriptedPipelineApi(
             sends=(
                 send_response(request_id="mms-req"),
@@ -1114,8 +1114,6 @@ class PipelineTests(unittest.TestCase):
         pipeline, clock, log, _ = self.make_pipeline(api, reservation(), split=True)
         result = pipeline.run(reservation(), work(), ("file-1", "file-2"))
 
-        title, lms_body = split_message_body(MESSAGE_BODY)
-
         self.assertEqual(result.row.delivery_status, "SENT")
         self.assertEqual(result.row.is_sent, "true")
         self.assertEqual(result.row.attempts, 1) # LMS attempts
@@ -1126,12 +1124,24 @@ class PipelineTests(unittest.TestCase):
             [call[0] for call in api.calls],
             ["send_mms", "list", "get", "send_lms", "list", "get"]
         )
-        self.assertEqual(api.calls[0][2:], (("file-1", "file-2"), "COMM", ".", "[개업소연 안내]"))
-        self.assertEqual(api.calls[3][2:], ("COMM", lms_body, "개업 인사말"))
+        self.assertEqual(
+            api.calls[0][2:],
+            (("file-1", "file-2"), "COMM", "윤성중 세무사 개업식장 안내", None),
+        )
+        self.assertEqual(
+            api.calls[3][2:],
+            (
+                "COMM",
+                "안녕하세요.\n"
+                "국세청에서의 오랜 경험을 바탕으로 호연회계법인에서 새로운 출발을 하게 된 윤성중 세무사입니다.\n\n"
+                "그동안 보내주신 관심에 감사드리며, 앞으로도 많은 응원과 격려 부탁드립니다.\n\n"
+                "뜻깊은 시작을 기쁜 마음으로 함께해 주시면 감사하겠습니다.",
+                "[개업소연]",
+            ),
+        )
 
     def test_split_dispatch_reconciliation_mms_success(self):
         """Verify that reconciliation resolves a successful MMS stage and automatically launches the LMS stage."""
-        title, lms_body = split_message_body(MESSAGE_BODY)
         api = ScriptedPipelineApi(
             sends=(
                 send_response(request_id="lms-req"),
@@ -1164,7 +1174,17 @@ class PipelineTests(unittest.TestCase):
             [call[0] for call in api.calls],
             ["get", "send_lms", "list", "get"]
         )
-        self.assertEqual(api.calls[1][2:], ("COMM", lms_body, "개업 인사말"))
+        self.assertEqual(
+            api.calls[1][2:],
+            (
+                "COMM",
+                "안녕하세요.\n"
+                "국세청에서의 오랜 경험을 바탕으로 호연회계법인에서 새로운 출발을 하게 된 윤성중 세무사입니다.\n\n"
+                "그동안 보내주신 관심에 감사드리며, 앞으로도 많은 응원과 격려 부탁드립니다.\n\n"
+                "뜻깊은 시작을 기쁜 마음으로 함께해 주시면 감사하겠습니다.",
+                "[개업소연]",
+            ),
+        )
 
 
 if __name__ == "__main__":

@@ -22,7 +22,7 @@ from .event_log import (
 )
 from .preflight import ApprovedWork
 from .results import ResultFormatError, ResultRow
-from .inputs import MESSAGE_BODY, split_message_body
+from .inputs import MESSAGE_BODY
 
 
 SEOUL = ZoneInfo("Asia/Seoul")
@@ -30,6 +30,8 @@ _SEND_ACTIONS = frozenset(
     {"RESUME_RESERVATION", "START_FRESH", "RETRY_EXPLICIT"}
 )
 _WORK_ACTIONS = _SEND_ACTIONS | frozenset({"HOLD_AMBIGUOUS", "RECONCILE"})
+_SPLIT_MMS_CONTENT = "윤성중 세무사 개업식장 안내"
+_SPLIT_LMS_SUBJECT = "[개업소연]"
 
 
 @dataclass(frozen=True)
@@ -86,8 +88,6 @@ class RecipientPipeline:
                 return PipelineResult(row)
             return self._send_single(row, work, tuple(file_ids))
 
-        title, lms_body = split_message_body(MESSAGE_BODY)
-
         if action == "RECONCILE":
             if not self._is_legal_reconciliation(row):
                 return PipelineResult(row)
@@ -98,7 +98,14 @@ class RecipientPipeline:
                 # MMS succeeded, proceed to LMS stage
                 lms_row = replace(reconcile_result.row, attempts=0, request_id="", message_id="")
                 lms_row = self._checkpoint(reconcile_result.row, lms_row)
-                return self._execute_stage("LMS", lms_row, work, file_ids=(), content=lms_body, subject="개업 인사말")
+                return self._execute_stage(
+                    "LMS",
+                    lms_row,
+                    work,
+                    file_ids=(),
+                    content=MESSAGE_BODY,
+                    subject=_SPLIT_LMS_SUBJECT,
+                )
             return reconcile_result
 
         if not self._is_legal_send(row, work):
@@ -121,15 +128,21 @@ class RecipientPipeline:
                 row,
                 work,
                 tuple(file_ids),
-                content=".",
-                subject="[개업소연 안내]",
+                content=_SPLIT_MMS_CONTENT,
                 retry_not_before=work.retry_not_before if work.action == "RETRY_EXPLICIT" else None,
             )
             if mms_result.stage_success:
                 # Reset attempts to 0 before starting LMS stage
                 lms_row = replace(mms_result.row, attempts=0, request_id="", message_id="")
                 lms_row = self._checkpoint(mms_result.row, lms_row)
-                return self._execute_stage("LMS", lms_row, work, file_ids=(), content=lms_body, subject="개업 인사말")
+                return self._execute_stage(
+                    "LMS",
+                    lms_row,
+                    work,
+                    file_ids=(),
+                    content=MESSAGE_BODY,
+                    subject=_SPLIT_LMS_SUBJECT,
+                )
             return mms_result
         else:
             return self._execute_stage(
@@ -137,8 +150,8 @@ class RecipientPipeline:
                 row,
                 work,
                 file_ids=(),
-                content=lms_body,
-                subject="개업 인사말",
+                content=MESSAGE_BODY,
+                subject=_SPLIT_LMS_SUBJECT,
                 retry_not_before=work.retry_not_before,
             )
 
@@ -263,7 +276,6 @@ class RecipientPipeline:
                         file_ids,
                         content_type=self.content_type,
                         content=content if content is not None else " ",
-                        subject=subject,
                     )
                 else:
                     response = self.api.send_lms(
@@ -770,7 +782,6 @@ class RecipientPipeline:
                     current.receiving_number,
                     file_ids,
                     content_type=self.content_type,
-                    subject="[개업소연 안내]",
                 )
             except ExplicitApiFailure as failure:
                 if failure.http_status == 429:

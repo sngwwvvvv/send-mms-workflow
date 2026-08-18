@@ -260,7 +260,7 @@ class ScriptedApi:
         self.uploaded.append(name)
         return f"file-{len(self.uploaded)}"
 
-    def send_one(self, to, file_ids, *, content_type):
+    def send_one(self, to, file_ids, *, content_type, subject=None):
         self.sent.append((to, tuple(file_ids)))
         self.sent_content_types.append(content_type)
         if self.on_send is not None:
@@ -506,7 +506,7 @@ class OrchestrationApi:
             self._on_upload(upload_number)
         return f"file-{upload_number}"
 
-    def send_one(self, to, file_ids, *, content_type):
+    def send_one(self, to, file_ids, *, content_type, subject=None):
         self._record_thread(to)
         wait_at_barrier = False
         with self._lock:
@@ -3805,15 +3805,22 @@ class WorkflowTests(unittest.TestCase):
         workflow = make_workflow(root, ResultStore.for_root(root), api, split=True)
         summary = workflow.run_live(workflow.current_token())
 
-        title, lms_body = split_message_body(MESSAGE_BODY)
-
         self.assertEqual((summary.sent, summary.failed, summary.pending), (1, 0, 0))
         self.assertEqual(len(api.uploaded), 2)
         self.assertEqual(
             api.sent,
             [
-                (RECIPIENT, ("file-1", "file-2"), "MMS", title),
-                (RECIPIENT, (), "LMS", lms_body),
+                (RECIPIENT, ("file-1", "file-2"), "MMS", "윤성중 세무사 개업식장 안내", None),
+                (
+                    RECIPIENT,
+                    (),
+                    "LMS",
+                    "안녕하세요.\n"
+                    "국세청에서의 오랜 경험을 바탕으로 호연회계법인에서 새로운 출발을 하게 된 윤성중 세무사입니다.\n\n"
+                    "그동안 보내주신 관심에 감사드리며, 앞으로도 많은 응원과 격려 부탁드립니다.\n\n"
+                    "뜻깊은 시작을 기쁜 마음으로 함께해 주시면 감사하겠습니다.",
+                    "[개업소연]",
+                ),
             ]
         )
 
@@ -3828,13 +3835,13 @@ class WorkflowTests(unittest.TestCase):
 
 
 class ScriptedSplitApi(ScriptedApi):
-    def send_mms(self, to, file_ids, *, content_type, content=" "):
-        self.sent.append((to, tuple(file_ids), "MMS", content))
+    def send_mms(self, to, file_ids, *, content_type, content=" ", subject=None):
+        self.sent.append((to, tuple(file_ids), "MMS", content, subject))
         self.sent_content_types.append(content_type)
         return self.sends.pop(0)
 
-    def send_lms(self, to, *, content_type, content=MESSAGE_BODY):
-        self.sent.append((to, (), "LMS", content))
+    def send_lms(self, to, *, content_type, content=MESSAGE_BODY, subject=None):
+        self.sent.append((to, (), "LMS", content, subject))
         self.sent_content_types.append(content_type)
         return self.sends.pop(0)
 
