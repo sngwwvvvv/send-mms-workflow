@@ -549,6 +549,19 @@ class CliTests(unittest.TestCase):
         self.assertIs(sens_mms_cli.main, packaged_cli.main)
         self.assertIs(sens_mms_cli.SystemClock, packaged_cli.SystemClock)
 
+    def test_default_root_remains_the_project_root_after_packaging(self):
+        observed_roots = []
+
+        def reject_config(root, environ):
+            observed_roots.append(root)
+            raise RuntimeError("stop after default-root capture")
+
+        with patch("sens_mms.cli.load_config", side_effect=reject_config):
+            code = packaged_cli.main(["preflight"], environ={}, stdout=StringIO())
+
+        self.assertEqual(code, 2)
+        self.assertEqual(observed_roots, [Path(__file__).resolve().parent.parent])
+
     def assert_public_safe(self, public, *additional):
         rendered = json.dumps(public, ensure_ascii=False)
         signature = make_signature(

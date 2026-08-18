@@ -113,7 +113,7 @@ def main(
     event_log_factory=create_event_log,
     delivery_id_factory=new_delivery_id,
 ):
-    project_root = Path(root) if root is not None else Path(__file__).parent
+    project_root = Path(root) if root is not None else Path(__file__).parent.parent
     output = stdout or sys.stdout
 
     try:
