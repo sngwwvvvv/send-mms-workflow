@@ -11,6 +11,7 @@ results/
 logs/
 mms_img/
 .superpowers/
+.worktrees/
 *.jsonl
 *.log
 __pycache__/

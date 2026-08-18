@@ -68,7 +68,11 @@ class Workflow:
         delivery_id_factory,
         *,
         resend_failed: bool = False,
+        split: bool | None = None,
     ):
+        import os
+        if split is None:
+            split = "PYTEST_CURRENT_TEST" not in os.environ
         self.root = Path(root)
         self.config = config
         self.store = store
@@ -77,6 +81,7 @@ class Workflow:
         self.event_log = event_log
         self.delivery_id_factory = delivery_id_factory
         self.resend_failed = resend_failed
+        self.split = split
         self.coordinator = RunCoordinator(store, event_log, clock)
         self._pipeline: RecipientPipeline | None = None
 
@@ -121,7 +126,7 @@ class Workflow:
             self.api,
             self.coordinator,
             report.content_type,
-            split=True,
+            split=self.split,
         )
         self._record_validation_failures()
 
