@@ -148,6 +148,16 @@ class SharedFailureApi:
             self.unrelated_called.set()
         raise ExplicitApiFailure("400", "fixed fake failure", http_status=400)
 
+    def send_mms(self, to, file_ids, *, content_type):
+        return self.send_one(to, file_ids, content_type=content_type)
+
+    def send_lms(self, to, *, content_type):
+        with self._lock:
+            self.calls.append((to, self.clock.monotonic()))
+        if threading.current_thread().name == "unrelated-worker":
+            self.unrelated_called.set()
+        raise ExplicitApiFailure("400", "fixed fake failure", http_status=400)
+
 
 class ScriptedPipelineApi:
     def __init__(self, *, sends=(), lists=(), gets=(), time_lists=()):
@@ -166,6 +176,14 @@ class ScriptedPipelineApi:
 
     def send_one(self, to, file_ids, *, content_type):
         self.calls.append(("send", to, tuple(file_ids), content_type))
+        return self._next(self.sends)
+
+    def send_mms(self, to, file_ids, *, content_type):
+        self.calls.append(("send_mms", to, tuple(file_ids), content_type))
+        return self._next(self.sends)
+
+    def send_lms(self, to, *, content_type):
+        self.calls.append(("send_lms", to, content_type))
         return self._next(self.sends)
 
     def list_by_request(self, request_id):
@@ -194,6 +212,14 @@ class TimestampingPipelineApi(ScriptedPipelineApi):
     def send_one(self, to, file_ids, *, content_type):
         self.send_times.append(self.clock.monotonic())
         return super().send_one(to, file_ids, content_type=content_type)
+
+    def send_mms(self, to, file_ids, *, content_type):
+        self.send_times.append(self.clock.monotonic())
+        return super().send_mms(to, file_ids, content_type=content_type)
+
+    def send_lms(self, to, *, content_type):
+        self.send_times.append(self.clock.monotonic())
+        return super().send_lms(to, content_type=content_type)
 
 
 def send_response(request_id="request-1"):
@@ -270,7 +296,7 @@ class PipelineTests(unittest.TestCase):
         self.addCleanup(self.directory.cleanup)
         self.path = Path(self.directory.name) / "results" / "result.csv"
 
-    def make_pipeline(self, api, row, *, event_log=None, store=None):
+    def make_pipeline(self, api, row, *, event_log=None, store=None, split=False):
         base = ResultStore(self.path)
         base.upsert(row)
         base.write_atomic()
@@ -278,7 +304,7 @@ class PipelineTests(unittest.TestCase):
         clock = ManualClock()
         log = event_log or RecordingEventLog()
         coordinator = RunCoordinator(store, log, clock)
-        return RecipientPipeline(api, coordinator, content_type="COMM"), clock, log, coordinator
+        return RecipientPipeline(api, coordinator, content_type="COMM", split=split), clock, log, coordinator
 
     def persisted(self):
         return ResultStore(self.path).load()[NUMBER]
@@ -1067,6 +1093,73 @@ class PipelineTests(unittest.TestCase):
         with self.assertRaisesRegex(ResultFormatError, "approved work recipient mismatch"):
             pipeline.run(row, mismatched, ("file-1", "file-2"))
         self.assertEqual(api.calls, [])
+
+    def test_split_dispatch_two_stage_success(self):
+        """Verify that split dispatch sends empty MMS, then resets attempts, then sends LMS with content."""
+        api = ScriptedPipelineApi(
+            sends=(
+                send_response(request_id="mms-req"),
+                send_response(request_id="lms-req"),
+            ),
+            lists=(
+                list_response(message("PROCESSING", request_id="mms-req", message_id="mms-msg")),
+                list_response(message("PROCESSING", request_id="lms-req", message_id="lms-msg", message_type="LMS")),
+            ),
+            gets=(
+                result_response(message("COMPLETED", "success", request_id="mms-req", message_id="mms-msg")),
+                result_response(message("COMPLETED", "success", request_id="lms-req", message_id="lms-msg", message_type="LMS")),
+            ),
+        )
+        pipeline, clock, log, _ = self.make_pipeline(api, reservation(), split=True)
+        result = pipeline.run(reservation(), work(), ("file-1", "file-2"))
+
+        self.assertEqual(result.row.delivery_status, "SENT")
+        self.assertEqual(result.row.is_sent, "true")
+        self.assertEqual(result.row.attempts, 1) # LMS attempts
+        self.assertEqual(result.row.request_id, "lms-req")
+        self.assertEqual(result.row.message_id, "lms-msg")
+        
+        self.assertEqual(
+            [call[0] for call in api.calls],
+            ["send_mms", "list", "get", "send_lms", "list", "get"]
+        )
+        self.assertEqual(api.calls[0][2:], (("file-1", "file-2"), "COMM"))
+        self.assertEqual(api.calls[3][2:], ("COMM",))
+
+    def test_split_dispatch_reconciliation_mms_success(self):
+        """Verify that reconciliation resolves a successful MMS stage and automatically launches the LMS stage."""
+        api = ScriptedPipelineApi(
+            sends=(
+                send_response(request_id="lms-req"),
+            ),
+            lists=(
+                list_response(message("PROCESSING", request_id="lms-req", message_id="lms-msg", message_type="LMS")),
+            ),
+            gets=(
+                result_response(message("COMPLETED", "success", request_id="mms-req", message_id="mms-msg", message_type="MMS")),
+                result_response(message("COMPLETED", "success", request_id="lms-req", message_id="lms-msg", message_type="LMS")),
+            ),
+        )
+        row = replace(
+            reservation(),
+            delivery_status="PENDING_CONFIRMATION",
+            attempts=1,
+            request_id="mms-req",
+            message_id="mms-msg",
+        )
+        pipeline, clock, log, _ = self.make_pipeline(api, row, split=True)
+        result = pipeline.run(row, work("RECONCILE", True))
+
+        self.assertEqual(result.row.delivery_status, "SENT")
+        self.assertEqual(result.row.is_sent, "true")
+        self.assertEqual(result.row.attempts, 1) # LMS attempts
+        self.assertEqual(result.row.request_id, "lms-req")
+        self.assertEqual(result.row.message_id, "lms-msg")
+
+        self.assertEqual(
+            [call[0] for call in api.calls],
+            ["get", "send_lms", "list", "get"]
+        )
 
 
 if __name__ == "__main__":

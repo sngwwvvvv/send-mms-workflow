@@ -121,6 +121,7 @@ class Workflow:
             self.api,
             self.coordinator,
             report.content_type,
+            split=True,
         )
         self._record_validation_failures()
 
