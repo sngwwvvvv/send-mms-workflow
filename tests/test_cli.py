@@ -17,7 +17,11 @@ from sens_mms.event_log import EventLogError, create_event_log
 from sens_mms.inputs import MESSAGE_BODY
 from sens_mms.preflight import build_preflight
 from sens_mms.results import ResultRow, ResultStore
-from sens_mms_cli import SystemClock, main
+import sens_mms_cli
+from sens_mms import cli as packaged_cli
+
+SystemClock = sens_mms_cli.SystemClock
+main = sens_mms_cli.main
 from tests.test_workflow import FakeClock, RECIPIENT, make_root
 
 
@@ -541,6 +545,10 @@ def seed_resend_root():
 
 
 class CliTests(unittest.TestCase):
+    def test_packaged_cli_and_legacy_wrapper_share_the_same_entrypoint(self):
+        self.assertIs(sens_mms_cli.main, packaged_cli.main)
+        self.assertIs(sens_mms_cli.SystemClock, packaged_cli.SystemClock)
+
     def assert_public_safe(self, public, *additional):
         rendered = json.dumps(public, ensure_ascii=False)
         signature = make_signature(
