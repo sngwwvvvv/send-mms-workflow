@@ -25,7 +25,7 @@ from sens_mms.api import (
 from sens_mms.config import Config
 from sens_mms.coordination import RUN_SETTINGS, RunCoordinator
 from sens_mms.event_log import EventLogError, JsonlEventLog
-from sens_mms.inputs import MESSAGE_BODY
+from sens_mms.inputs import MESSAGE_BODY, split_message_body
 from sens_mms.preflight import canonical_result_state
 from sens_mms.results import ResultFormatError, ResultRow, ResultStore
 from sens_mms.workflow import Workflow
@@ -3805,13 +3805,15 @@ class WorkflowTests(unittest.TestCase):
         workflow = make_workflow(root, ResultStore.for_root(root), api, split=True)
         summary = workflow.run_live(workflow.current_token())
 
+        title, lms_body = split_message_body(MESSAGE_BODY)
+
         self.assertEqual((summary.sent, summary.failed, summary.pending), (1, 0, 0))
         self.assertEqual(len(api.uploaded), 2)
         self.assertEqual(
             api.sent,
             [
-                (RECIPIENT, ("file-1", "file-2"), "MMS"),
-                (RECIPIENT, (), "LMS"),
+                (RECIPIENT, ("file-1", "file-2"), "MMS", title),
+                (RECIPIENT, (), "LMS", lms_body),
             ]
         )
 
@@ -3826,13 +3828,13 @@ class WorkflowTests(unittest.TestCase):
 
 
 class ScriptedSplitApi(ScriptedApi):
-    def send_mms(self, to, file_ids, *, content_type):
-        self.sent.append((to, tuple(file_ids), "MMS"))
+    def send_mms(self, to, file_ids, *, content_type, content=" "):
+        self.sent.append((to, tuple(file_ids), "MMS", content))
         self.sent_content_types.append(content_type)
         return self.sends.pop(0)
 
-    def send_lms(self, to, *, content_type):
-        self.sent.append((to, (), "LMS"))
+    def send_lms(self, to, *, content_type, content=MESSAGE_BODY):
+        self.sent.append((to, (), "LMS", content))
         self.sent_content_types.append(content_type)
         return self.sends.pop(0)
 

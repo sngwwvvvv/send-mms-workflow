@@ -22,6 +22,7 @@ from .event_log import (
 )
 from .preflight import ApprovedWork
 from .results import ResultFormatError, ResultRow
+from .inputs import MESSAGE_BODY, split_message_body
 
 
 SEOUL = ZoneInfo("Asia/Seoul")
@@ -85,6 +86,8 @@ class RecipientPipeline:
                 return PipelineResult(row)
             return self._send_single(row, work, tuple(file_ids))
 
+        title, lms_body = split_message_body(MESSAGE_BODY)
+
         if action == "RECONCILE":
             if not self._is_legal_reconciliation(row):
                 return PipelineResult(row)
@@ -95,7 +98,7 @@ class RecipientPipeline:
                 # MMS succeeded, proceed to LMS stage
                 lms_row = replace(reconcile_result.row, attempts=0, request_id="", message_id="")
                 lms_row = self._checkpoint(reconcile_result.row, lms_row)
-                return self._execute_stage("LMS", lms_row, work, file_ids=())
+                return self._execute_stage("LMS", lms_row, work, file_ids=(), content=lms_body)
             return reconcile_result
 
         if not self._is_legal_send(row, work):
@@ -118,13 +121,14 @@ class RecipientPipeline:
                 row,
                 work,
                 tuple(file_ids),
+                content=title,
                 retry_not_before=work.retry_not_before if work.action == "RETRY_EXPLICIT" else None,
             )
             if mms_result.stage_success:
                 # Reset attempts to 0 before starting LMS stage
                 lms_row = replace(mms_result.row, attempts=0, request_id="", message_id="")
                 lms_row = self._checkpoint(mms_result.row, lms_row)
-                return self._execute_stage("LMS", lms_row, work, file_ids=())
+                return self._execute_stage("LMS", lms_row, work, file_ids=(), content=lms_body)
             return mms_result
         else:
             return self._execute_stage(
@@ -132,6 +136,7 @@ class RecipientPipeline:
                 row,
                 work,
                 file_ids=(),
+                content=lms_body,
                 retry_not_before=work.retry_not_before,
             )
 
@@ -206,6 +211,7 @@ class RecipientPipeline:
         work: ApprovedWork,
         file_ids: tuple[str, ...],
         *,
+        content: str | None = None,
         retry_not_before: float | None = None,
     ) -> PipelineResult:
         current = row
@@ -253,11 +259,13 @@ class RecipientPipeline:
                         current.receiving_number,
                         file_ids,
                         content_type=self.content_type,
+                        content=content if content is not None else " ",
                     )
                 else:
                     response = self.api.send_lms(
                         current.receiving_number,
                         content_type=self.content_type,
+                        content=content if content is not None else MESSAGE_BODY,
                     )
             except ExplicitApiFailure as failure:
                 if failure.http_status == 429:
