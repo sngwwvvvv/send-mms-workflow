@@ -16,3 +16,6 @@ mms_img/
 __pycache__/
 .venv/
 venv/
+
+dist/
+*.egg-info/
