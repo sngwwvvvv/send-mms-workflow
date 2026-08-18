@@ -39,6 +39,15 @@ class ProjectMetadataTests(unittest.TestCase):
         self.assertIn("sens-mms", packages)
         self.assertEqual(packages["tzdata"]["version"], "2026.3")
 
+    def test_readme_uses_locked_uv_cli_and_preserves_legacy_launcher(self):
+        readme = (ROOT / "README.md").read_text("utf-8")
+
+        self.assertIn("uv sync --locked", readme)
+        self.assertIn("uv run sens-mms preflight", readme)
+        self.assertIn("uv run sens-mms live", readme)
+        self.assertIn("uv run sens-mms preflight --resend-failed", readme)
+        self.assertIn("python sens_mms_cli.py", readme)
+
 
 if __name__ == "__main__":
     unittest.main()
