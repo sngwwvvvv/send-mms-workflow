@@ -2,12 +2,22 @@
 
 이 프로젝트는 승인된 본문과 이미지 두 장을 수신번호별 단건 MMS 요청으로 처리한다. 구현 완료, 테스트 통과, main 브랜치 병합, `preflight` 실행은 모두 실발송 승인이 아니다. `live` 실행마다 직전에 생성된 승인 토큰과 발신번호 등록 확인에 대해 별도의 명시적 승인을 받아야 한다.
 
+## 실행 환경 준비
+
+이 저장소는 Python 3.14와 잠긴 의존성 집합을 `uv.lock`으로 관리한다. 프로젝트 루트에서 다음 명령으로 동일한 실행 환경을 준비한다.
+
+```powershell
+uv sync --locked
+```
+
+`.env`는 uv 의존성 파일이 아니므로 커밋하지 않는다. `uv sync`와 `--help` 확인은 실발송 승인이 아니며 SENS API를 호출하지 않는다.
+
 ## 일반 발송
 
 ```powershell
-python sens_mms_cli.py preflight
+uv run sens-mms preflight
 $approvalToken = Read-Host 'Paste the approval_token printed by this exact preflight'
-python sens_mms_cli.py live --approval-token $approvalToken --confirm-sender-registered
+uv run sens-mms live --approval-token $approvalToken --confirm-sender-registered
 ```
 
 `preflight`는 네트워크 요청과 이벤트 로그 생성을 하지 않는다. 출력에서 총 대상 건수, 마스킹된 번호 표본, 등록된 발신번호, 정확한 본문, 이미지 검증 결과, `type=MMS`, `subject=null`, `contentType=COMM`, 아래 고정 설정을 확인한다. 입력, 이미지, 기존 결과 상태, 재발송 스냅샷 또는 승인 대상이 바뀌면 이전 토큰은 사용할 수 없다.
@@ -39,10 +49,14 @@ python sens_mms_cli.py live --approval-token $approvalToken --confirm-sender-reg
 ## 실패 건 별도 재발송
 
 ```powershell
-python sens_mms_cli.py preflight --resend-failed
+uv run sens-mms preflight --resend-failed
 $resendApprovalToken = Read-Host 'Paste the approval_token printed by this exact resend preflight'
-python sens_mms_cli.py live --resend-failed --approval-token $resendApprovalToken --confirm-sender-registered
+uv run sens-mms live --resend-failed --approval-token $resendApprovalToken --confirm-sender-registered
 ```
+
+## 기존 실행 스크립트 호환
+
+기존 자동화도 같은 uv 환경에서 `uv run python sens_mms_cli.py preflight`처럼 계속 실행할 수 있다. 다만 운영 문서와 예시는 설치된 `sens-mms` 진입점을 기본 경로로 사용한다.
 
 재발송 사전 검증은 `results` 폴더에서 파일명 기준으로 가장 최신인 완료 스냅샷 하나를 선택한다. 선택된 스냅샷이 손상됐거나 현재 `result.csv`의 대상 행과 정확히 일치하지 않으면 이전 스냅샷으로 되돌아가지 않고 차단한다. 승인 토큰을 실행 잠금 안에서 다시 검증한 직후, 검증 실패 기록·첨부 업로드·예약·메시지 API보다 먼저 현재 `result.csv` 전체의 불변 재발송 전 보관본을 만든다. 보관본 또는 비식별 `RESEND_ARCHIVE_WRITTEN` 이벤트 기록에 실패하면 어떤 결과 변경이나 API 호출도 시작하지 않는다. 승인된 `FAILED` 후보만 새 `delivery_id`와 `attempts=0`으로 시작한다. 기존 `SENT`, `PENDING_CONFIRMATION`, 입력 검증 실패, 승인 대상이 아닌 행은 초기화하지 않는다. 현재 CSV에 있는 기존 attempts-zero 예약은 재발송 모드에서도 같은 ID로 먼저 이어서 처리한다.
 
