@@ -1126,7 +1126,7 @@ class PipelineTests(unittest.TestCase):
         )
         self.assertEqual(
             api.calls[0][2:],
-            (("file-1", "file-2"), "COMM", "윤성중 세무사 개업식장 안내", None),
+            (("file-1", "file-2"), "COMM", ".", None),
         )
         self.assertEqual(
             api.calls[3][2:],

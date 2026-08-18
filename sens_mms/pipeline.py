@@ -30,7 +30,7 @@ _SEND_ACTIONS = frozenset(
     {"RESUME_RESERVATION", "START_FRESH", "RETRY_EXPLICIT"}
 )
 _WORK_ACTIONS = _SEND_ACTIONS | frozenset({"HOLD_AMBIGUOUS", "RECONCILE"})
-_SPLIT_MMS_CONTENT = "윤성중 세무사 개업식장 안내"
+_SPLIT_MMS_CONTENT = "."
 _SPLIT_LMS_CONTENT = (
     "[개업소연 안내]\n\n"
     "안녕하세요.\n"

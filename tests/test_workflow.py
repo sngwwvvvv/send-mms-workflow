@@ -3810,7 +3810,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(
             api.sent,
             [
-                (RECIPIENT, ("file-1", "file-2"), "MMS", "윤성중 세무사 개업식장 안내", None),
+                (RECIPIENT, ("file-1", "file-2"), "MMS", ".", None),
                 (
                     RECIPIENT,
                     (),
