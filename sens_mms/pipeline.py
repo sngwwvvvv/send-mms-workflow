@@ -31,7 +31,13 @@ _SEND_ACTIONS = frozenset(
 )
 _WORK_ACTIONS = _SEND_ACTIONS | frozenset({"HOLD_AMBIGUOUS", "RECONCILE"})
 _SPLIT_MMS_CONTENT = "윤성중 세무사 개업식장 안내"
-_SPLIT_LMS_SUBJECT = "[개업소연]"
+_SPLIT_LMS_CONTENT = (
+    "[개업소연 안내]\n\n"
+    "안녕하세요.\n"
+    "국세청에서의 오랜 경험을 바탕으로 호연회계법인에서 새로운 출발을 하게 된 윤성중 세무사입니다.\n\n"
+    "그동안 보내주신 관심에 감사드리며, 앞으로도 많은 응원과 격려 부탁드립니다.\n\n"
+    "뜻깊은 시작을 기쁜 마음으로 함께해 주시면 감사하겠습니다."
+)
 
 
 @dataclass(frozen=True)
@@ -103,8 +109,7 @@ class RecipientPipeline:
                     lms_row,
                     work,
                     file_ids=(),
-                    content=MESSAGE_BODY,
-                    subject=_SPLIT_LMS_SUBJECT,
+                    content=_SPLIT_LMS_CONTENT,
                 )
             return reconcile_result
 
@@ -140,8 +145,7 @@ class RecipientPipeline:
                     lms_row,
                     work,
                     file_ids=(),
-                    content=MESSAGE_BODY,
-                    subject=_SPLIT_LMS_SUBJECT,
+                    content=_SPLIT_LMS_CONTENT,
                 )
             return mms_result
         else:
@@ -150,8 +154,7 @@ class RecipientPipeline:
                 row,
                 work,
                 file_ids=(),
-                content=MESSAGE_BODY,
-                subject=_SPLIT_LMS_SUBJECT,
+                content=_SPLIT_LMS_CONTENT,
                 retry_not_before=work.retry_not_before,
             )
 
