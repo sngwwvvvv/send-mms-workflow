@@ -43,10 +43,34 @@ class ProjectMetadataTests(unittest.TestCase):
         readme = (ROOT / "README.md").read_text("utf-8")
 
         self.assertIn("uv sync --locked", readme)
+        self.assertIn("## 실행 환경 준비", readme)
+        self.assertIn(
+            "이 저장소는 Python 3.14와 잠긴 의존성 집합을 `uv.lock`으로 "
+            "관리한다. 프로젝트 루트에서 다음 명령으로 동일한 실행 환경을 "
+            "준비한다.",
+            readme,
+        )
+        self.assertIn(
+            "`.env`는 uv 의존성 파일이 아니므로 커밋하지 않는다. `uv sync`와 "
+            "`--help` 확인은 실발송 승인이 아니며 SENS API를 호출하지 않는다.",
+            readme,
+        )
         self.assertIn("uv run sens-mms preflight", readme)
         self.assertIn("uv run sens-mms live", readme)
         self.assertIn("uv run sens-mms preflight --resend-failed", readme)
-        self.assertIn("python sens_mms_cli.py", readme)
+        self.assertIn(
+            "uv run sens-mms live --resend-failed --approval-token "
+            "$resendApprovalToken --confirm-sender-registered",
+            readme,
+        )
+        self.assertIn("## 기존 실행 스크립트 호환", readme)
+        self.assertIn(
+            "기존 자동화도 같은 uv 환경에서 `uv run python sens_mms_cli.py "
+            "preflight`처럼 계속 실행할 수 있다. 다만 운영 문서와 예시는 "
+            "설치된 `sens-mms` 진입점을 기본 경로로 사용한다.",
+            readme,
+        )
+        self.assertIn("uv run python sens_mms_cli.py preflight", readme)
 
 
 if __name__ == "__main__":
