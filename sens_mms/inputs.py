@@ -108,3 +108,18 @@ def validate_images(directory):
     if extras:
         raise ValueError("exactly two JPEG images required")
     return tuple(infos)
+
+
+def split_message_body(body: str) -> tuple[str, str]:
+    lines = body.splitlines()
+    if lines and lines[0].startswith("[") and lines[0].endswith("]"):
+        title = lines[0]
+        idx = 1
+        while idx < len(lines) and not lines[idx].strip():
+            idx += 1
+        rest = "\n".join(lines[idx:])
+        if body.endswith("\n") and rest and not rest.endswith("\n"):
+            rest += "\n"
+        return title, rest
+    return " ", body
+

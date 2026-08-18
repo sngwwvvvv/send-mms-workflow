@@ -1,6 +1,6 @@
 import tempfile, unittest
 from pathlib import Path
-from sens_mms.inputs import load_recipients, MESSAGE_BODY, validate_images
+from sens_mms.inputs import load_recipients, MESSAGE_BODY, validate_images, split_message_body
 
 
 EXPECTED_BODY = (
@@ -35,3 +35,22 @@ class InputTests(unittest.TestCase):
 
         self.assertEqual(infos[0].data, first)
         self.assertEqual(infos[1].data, second)
+
+    def test_split_message_body_with_title(self):
+        body = "[Test Title]\n\nHello World\nLine 2\n"
+        title, rest = split_message_body(body)
+        self.assertEqual(title, "[Test Title]")
+        self.assertEqual(rest, "Hello World\nLine 2\n")
+
+    def test_split_message_body_without_title(self):
+        body = "Hello World\nLine 2\n"
+        title, rest = split_message_body(body)
+        self.assertEqual(title, " ")
+        self.assertEqual(rest, "Hello World\nLine 2\n")
+
+    def test_split_approved_message_body(self):
+        title, rest = split_message_body(MESSAGE_BODY)
+        self.assertEqual(title, "[개업소연 안내]")
+        self.assertTrue(rest.startswith("안녕하세요."))
+        self.assertTrue(rest.endswith("새로운 시작을 기쁜 마음으로 함께해 주시면 감사하겠습니다.\n"))
+
