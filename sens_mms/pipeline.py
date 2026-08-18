@@ -98,7 +98,7 @@ class RecipientPipeline:
                 # MMS succeeded, proceed to LMS stage
                 lms_row = replace(reconcile_result.row, attempts=0, request_id="", message_id="")
                 lms_row = self._checkpoint(reconcile_result.row, lms_row)
-                return self._execute_stage("LMS", lms_row, work, file_ids=(), content=lms_body)
+                return self._execute_stage("LMS", lms_row, work, file_ids=(), content=lms_body, subject="개업 인사말")
             return reconcile_result
 
         if not self._is_legal_send(row, work):
@@ -121,14 +121,15 @@ class RecipientPipeline:
                 row,
                 work,
                 tuple(file_ids),
-                content=title,
+                content=".",
+                subject="[개업소연 안내]",
                 retry_not_before=work.retry_not_before if work.action == "RETRY_EXPLICIT" else None,
             )
             if mms_result.stage_success:
                 # Reset attempts to 0 before starting LMS stage
                 lms_row = replace(mms_result.row, attempts=0, request_id="", message_id="")
                 lms_row = self._checkpoint(mms_result.row, lms_row)
-                return self._execute_stage("LMS", lms_row, work, file_ids=(), content=lms_body)
+                return self._execute_stage("LMS", lms_row, work, file_ids=(), content=lms_body, subject="개업 인사말")
             return mms_result
         else:
             return self._execute_stage(
@@ -137,6 +138,7 @@ class RecipientPipeline:
                 work,
                 file_ids=(),
                 content=lms_body,
+                subject="개업 인사말",
                 retry_not_before=work.retry_not_before,
             )
 
@@ -213,6 +215,7 @@ class RecipientPipeline:
         *,
         content: str | None = None,
         retry_not_before: float | None = None,
+        subject: str | None = None,
     ) -> PipelineResult:
         current = row
         if work.action == "RETRY_EXPLICIT" and retry_not_before is None:
@@ -260,12 +263,14 @@ class RecipientPipeline:
                         file_ids,
                         content_type=self.content_type,
                         content=content if content is not None else " ",
+                        subject=subject,
                     )
                 else:
                     response = self.api.send_lms(
                         current.receiving_number,
                         content_type=self.content_type,
                         content=content if content is not None else MESSAGE_BODY,
+                        subject=subject,
                     )
             except ExplicitApiFailure as failure:
                 if failure.http_status == 429:
@@ -765,6 +770,7 @@ class RecipientPipeline:
                     current.receiving_number,
                     file_ids,
                     content_type=self.content_type,
+                    subject="[개업소연 안내]",
                 )
             except ExplicitApiFailure as failure:
                 if failure.http_status == 429:

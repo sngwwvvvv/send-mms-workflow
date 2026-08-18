@@ -142,17 +142,17 @@ class SharedFailureApi:
         self._lock = threading.Lock()
         self.unrelated_called = threading.Event()
 
-    def send_one(self, to, file_ids, *, content_type):
+    def send_one(self, to, file_ids, *, content_type, subject=None):
         with self._lock:
             self.calls.append((to, self.clock.monotonic()))
         if threading.current_thread().name == "unrelated-worker":
             self.unrelated_called.set()
         raise ExplicitApiFailure("400", "fixed fake failure", http_status=400)
 
-    def send_mms(self, to, file_ids, *, content_type, content=" "):
+    def send_mms(self, to, file_ids, *, content_type, content=" ", subject=None):
         return self.send_one(to, file_ids, content_type=content_type)
 
-    def send_lms(self, to, *, content_type, content=MESSAGE_BODY):
+    def send_lms(self, to, *, content_type, content=MESSAGE_BODY, subject=None):
         with self._lock:
             self.calls.append((to, self.clock.monotonic()))
         if threading.current_thread().name == "unrelated-worker":
@@ -175,16 +175,16 @@ class ScriptedPipelineApi:
             raise item
         return item
 
-    def send_one(self, to, file_ids, *, content_type):
+    def send_one(self, to, file_ids, *, content_type, subject=None):
         self.calls.append(("send", to, tuple(file_ids), content_type))
         return self._next(self.sends)
 
-    def send_mms(self, to, file_ids, *, content_type, content=" "):
-        self.calls.append(("send_mms", to, tuple(file_ids), content_type, content))
+    def send_mms(self, to, file_ids, *, content_type, content=" ", subject=None):
+        self.calls.append(("send_mms", to, tuple(file_ids), content_type, content, subject))
         return self._next(self.sends)
 
-    def send_lms(self, to, *, content_type, content=MESSAGE_BODY):
-        self.calls.append(("send_lms", to, content_type, content))
+    def send_lms(self, to, *, content_type, content=MESSAGE_BODY, subject=None):
+        self.calls.append(("send_lms", to, content_type, content, subject))
         return self._next(self.sends)
 
     def list_by_request(self, request_id):
@@ -210,17 +210,17 @@ class TimestampingPipelineApi(ScriptedPipelineApi):
         self.clock = clock
         self.send_times = []
 
-    def send_one(self, to, file_ids, *, content_type):
+    def send_one(self, to, file_ids, *, content_type, subject=None):
         self.send_times.append(self.clock.monotonic())
-        return super().send_one(to, file_ids, content_type=content_type)
+        return super().send_one(to, file_ids, content_type=content_type, subject=subject)
 
-    def send_mms(self, to, file_ids, *, content_type, content=" "):
+    def send_mms(self, to, file_ids, *, content_type, content=" ", subject=None):
         self.send_times.append(self.clock.monotonic())
-        return super().send_mms(to, file_ids, content_type=content_type, content=content)
+        return super().send_mms(to, file_ids, content_type=content_type, content=content, subject=subject)
 
-    def send_lms(self, to, *, content_type, content=MESSAGE_BODY):
+    def send_lms(self, to, *, content_type, content=MESSAGE_BODY, subject=None):
         self.send_times.append(self.clock.monotonic())
-        return super().send_lms(to, content_type=content_type, content=content)
+        return super().send_lms(to, content_type=content_type, content=content, subject=subject)
 
 
 def send_response(request_id="request-1"):
@@ -1126,8 +1126,8 @@ class PipelineTests(unittest.TestCase):
             [call[0] for call in api.calls],
             ["send_mms", "list", "get", "send_lms", "list", "get"]
         )
-        self.assertEqual(api.calls[0][2:], (("file-1", "file-2"), "COMM", title))
-        self.assertEqual(api.calls[3][2:], ("COMM", lms_body))
+        self.assertEqual(api.calls[0][2:], (("file-1", "file-2"), "COMM", ".", "[개업소연 안내]"))
+        self.assertEqual(api.calls[3][2:], ("COMM", lms_body, "개업 인사말"))
 
     def test_split_dispatch_reconciliation_mms_success(self):
         """Verify that reconciliation resolves a successful MMS stage and automatically launches the LMS stage."""
@@ -1164,7 +1164,7 @@ class PipelineTests(unittest.TestCase):
             [call[0] for call in api.calls],
             ["get", "send_lms", "list", "get"]
         )
-        self.assertEqual(api.calls[1][2:], ("COMM", lms_body))
+        self.assertEqual(api.calls[1][2:], ("COMM", lms_body, "개업 인사말"))
 
 
 if __name__ == "__main__":
