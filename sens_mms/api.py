@@ -315,6 +315,46 @@ class SensClient:
             status_name=_exact_string(data.get("statusName")),
         )
 
+    def send_mms(
+        self,
+        to: str,
+        file_ids: Sequence[str],
+        *,
+        content_type: str,
+    ) -> SendResponse:
+        if type(content_type) is not str or content_type not in {"COMM", "AD"}:
+            raise ExplicitApiFailure("INVALID_REQUEST", "content type is invalid")
+        return self._send_message(
+            {
+                "type": "MMS",
+                "contentType": content_type,
+                "countryCode": "82",
+                "from": self._from_number,
+                "content": "",
+                "messages": [{"to": to}],
+                "files": [{"fileId": file_id} for file_id in file_ids],
+            }
+        )
+
+    def send_lms(
+        self,
+        to: str,
+        *,
+        content_type: str,
+    ) -> SendResponse:
+        if type(content_type) is not str or content_type not in {"COMM", "AD"}:
+            raise ExplicitApiFailure("INVALID_REQUEST", "content type is invalid")
+        return self._send_message(
+            {
+                "type": "LMS",
+                "contentType": content_type,
+                "countryCode": "82",
+                "from": self._from_number,
+                "content": MESSAGE_BODY,
+                "messages": [{"to": to}],
+            }
+        )
+
     def send_one(
         self,
         to: str,
