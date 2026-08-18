@@ -265,6 +265,7 @@ def _serialize_event_line(
     event,
     delivery_id=None,
     attempt=None,
+    stage=None,
     api=None,
     http_status=None,
     request_id=None,
@@ -276,6 +277,8 @@ def _serialize_event_line(
     completed_at=None,
     result_snapshot=None,
 ):
+    if stage is not None and stage not in {"MMS", "LMS"}:
+        _invalid_event_data()
     response = _sanitize_response(response) if response is not None else None
     error = _sanitize_error(error) if error is not None else None
     state = _sanitize_state(state) if state is not None else None
@@ -289,6 +292,7 @@ def _serialize_event_line(
         "event": event,
         "delivery_id": delivery_id,
         "attempt": attempt,
+        "stage": stage,
         "api": api,
         "http_status": http_status,
         "request_id": request_id,
@@ -325,6 +329,7 @@ class JsonlEventLog:
         *,
         delivery_id=None,
         attempt=None,
+        stage=None,
         api=None,
         http_status=None,
         request_id=None,
@@ -346,6 +351,7 @@ class JsonlEventLog:
                 event=event,
                 delivery_id=delivery_id,
                 attempt=attempt,
+                stage=stage,
                 api=api,
                 http_status=http_status,
                 request_id=request_id,

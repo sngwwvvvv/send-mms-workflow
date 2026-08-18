@@ -74,6 +74,7 @@ class EventLogTests(unittest.TestCase):
                 "event": "RESULT_SNAPSHOT_WRITTEN",
                 "delivery_id": None,
                 "attempt": None,
+                "stage": None,
                 "api": None,
                 "http_status": None,
                 "request_id": None,
@@ -106,6 +107,7 @@ class EventLogTests(unittest.TestCase):
             {
                 "delivery_id": None,
                 "attempt": None,
+                "stage": None,
                 "api": None,
                 "http_status": None,
                 "request_id": None,
@@ -523,6 +525,7 @@ class EventLogTests(unittest.TestCase):
                 "event": "send_response",
                 "delivery_id": "delivery-1",
                 "attempt": 1,
+                "stage": None,
                 "api": None,
                 "http_status": 202,
                 "request_id": None,
@@ -541,6 +544,7 @@ class EventLogTests(unittest.TestCase):
                 "event": "get_response",
                 "delivery_id": "delivery-1",
                 "attempt": 1,
+                "stage": None,
                 "api": None,
                 "http_status": None,
                 "request_id": None,
@@ -583,11 +587,19 @@ class EventLogTests(unittest.TestCase):
         self.assertEqual(
             tuple(parameters),
             (
-                "self", "event", "delivery_id", "attempt", "api", "http_status",
+                "self", "event", "delivery_id", "attempt", "stage", "api", "http_status",
                 "request_id", "message_id", "response", "error", "state", "summary",
                 "completed_at", "result_snapshot",
             ),
         )
+
+    def test_write_records_stage_value_in_jsonl(self):
+        path = Path(tempfile.mkdtemp()) / "delivery.jsonl"
+        now = lambda: datetime(2026, 8, 14, 3, 4, 5, 678901, tzinfo=timezone.utc)
+        with JsonlEventLog(path, now=now) as log:
+            log.write("send_response", delivery_id="delivery-1", attempt=1, stage="MMS")
+        row = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(row["stage"], "MMS")
 
     def test_create_event_log_uses_seoul_name_and_same_second_collision_suffix(self):
         """Catches a factory that overwrites the same-second log instead of reserving a new file."""
