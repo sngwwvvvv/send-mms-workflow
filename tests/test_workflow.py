@@ -770,6 +770,7 @@ def make_workflow(
     delivery_id_factory=None,
     *,
     resend_failed=False,
+    split=False,
 ):
     return Workflow(
         root,
@@ -781,6 +782,7 @@ def make_workflow(
         delivery_id_factory
         or FixedIdFactory(DELIVERY_ID_1, DELIVERY_ID_2, DELIVERY_ID_3),
         resend_failed=resend_failed,
+        split=split,
     )
 
 
@@ -3783,6 +3785,56 @@ class WorkflowTests(unittest.TestCase):
             workflow.current_token()
 
         self.assertEqual((api.uploaded, api.sent), ([], []))
+
+    def test_workflow_split_dispatch_success(self):
+        root = make_root()
+        api = ScriptedSplitApi(
+            sends=[
+                SendResponse(202, "mms-req", "2026-08-18T10:00:00.000", "202", "success"),
+                SendResponse(202, "lms-req", "2026-08-18T10:00:00.000", "202", "success"),
+            ],
+            lists=[
+                list_response(MessageRecord("mms-req", "mms-msg", RECIPIENT, "2026-08-18 10:00:00", "2026-08-18 10:00:01", "SKT", "PROCESSING", "0", "success", "", "MMS")),
+                list_response(MessageRecord("lms-req", "lms-msg", RECIPIENT, "2026-08-18 10:00:00", "2026-08-18 10:00:01", "SKT", "PROCESSING", "0", "success", "", "LMS")),
+            ],
+            gets=[
+                result_response(MessageRecord("mms-req", "mms-msg", RECIPIENT, "2026-08-18 10:00:00", "2026-08-18 10:00:01", "SKT", "COMPLETED", "0", "success", "", "MMS")),
+                result_response(MessageRecord("lms-req", "lms-msg", RECIPIENT, "2026-08-18 10:00:00", "2026-08-18 10:00:01", "SKT", "COMPLETED", "0", "success", "", "LMS")),
+            ],
+        )
+        workflow = make_workflow(root, ResultStore.for_root(root), api, split=True)
+        summary = workflow.run_live(workflow.current_token())
+
+        self.assertEqual((summary.sent, summary.failed, summary.pending), (1, 0, 0))
+        self.assertEqual(len(api.uploaded), 2)
+        self.assertEqual(
+            api.sent,
+            [
+                (RECIPIENT, ("file-1", "file-2"), "MMS"),
+                (RECIPIENT, (), "LMS"),
+            ]
+        )
+
+        # Check result row
+        rows = ResultStore.for_root(root).load()
+        row = rows[RECIPIENT]
+        self.assertEqual(row.delivery_status, "SENT")
+        self.assertEqual(row.is_sent, "true")
+        self.assertEqual(row.attempts, 1) # LMS attempts
+        self.assertEqual(row.request_id, "lms-req")
+        self.assertEqual(row.message_id, "lms-msg")
+
+
+class ScriptedSplitApi(ScriptedApi):
+    def send_mms(self, to, file_ids, *, content_type):
+        self.sent.append((to, tuple(file_ids), "MMS"))
+        self.sent_content_types.append(content_type)
+        return self.sends.pop(0)
+
+    def send_lms(self, to, *, content_type):
+        self.sent.append((to, (), "LMS"))
+        self.sent_content_types.append(content_type)
+        return self.sends.pop(0)
 
 
 if __name__ == "__main__":
