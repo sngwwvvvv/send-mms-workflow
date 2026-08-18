@@ -322,20 +322,22 @@ class SensClient:
         *,
         content_type: str,
         content: str = " ",
+        subject: str | None = None,
     ) -> SendResponse:
         if type(content_type) is not str or content_type not in {"COMM", "AD"}:
             raise ExplicitApiFailure("INVALID_REQUEST", "content type is invalid")
-        return self._send_message(
-            {
-                "type": "MMS",
-                "contentType": content_type,
-                "countryCode": "82",
-                "from": self._from_number,
-                "content": content,
-                "messages": [{"to": to}],
-                "files": [{"fileId": file_id} for file_id in file_ids],
-            }
-        )
+        payload = {
+            "type": "MMS",
+            "contentType": content_type,
+            "countryCode": "82",
+            "from": self._from_number,
+            "content": content,
+            "messages": [{"to": to}],
+            "files": [{"fileId": file_id} for file_id in file_ids],
+        }
+        if subject is not None:
+            payload["subject"] = subject
+        return self._send_message(payload)
 
     def send_lms(
         self,
@@ -343,19 +345,21 @@ class SensClient:
         *,
         content_type: str,
         content: str = MESSAGE_BODY,
+        subject: str | None = None,
     ) -> SendResponse:
         if type(content_type) is not str or content_type not in {"COMM", "AD"}:
             raise ExplicitApiFailure("INVALID_REQUEST", "content type is invalid")
-        return self._send_message(
-            {
-                "type": "LMS",
-                "contentType": content_type,
-                "countryCode": "82",
-                "from": self._from_number,
-                "content": content,
-                "messages": [{"to": to}],
-            }
-        )
+        payload = {
+            "type": "LMS",
+            "contentType": content_type,
+            "countryCode": "82",
+            "from": self._from_number,
+            "content": content,
+            "messages": [{"to": to}],
+        }
+        if subject is not None:
+            payload["subject"] = subject
+        return self._send_message(payload)
 
     def send_one(
         self,
@@ -363,20 +367,22 @@ class SensClient:
         file_ids: Sequence[str],
         *,
         content_type: str,
+        subject: str | None = None,
     ) -> SendResponse:
         if type(content_type) is not str or content_type not in {"COMM", "AD"}:
             raise ExplicitApiFailure("INVALID_REQUEST", "content type is invalid")
-        return self._send_message(
-            {
-                "type": "MMS",
-                "contentType": content_type,
-                "countryCode": "82",
-                "from": self._from_number,
-                "content": MESSAGE_BODY,
-                "messages": [{"to": to}],
-                "files": [{"fileId": file_id} for file_id in file_ids],
-            }
-        )
+        payload = {
+            "type": "MMS",
+            "contentType": content_type,
+            "countryCode": "82",
+            "from": self._from_number,
+            "content": MESSAGE_BODY,
+            "messages": [{"to": to}],
+            "files": [{"fileId": file_id} for file_id in file_ids],
+        }
+        if subject is not None:
+            payload["subject"] = subject
+        return self._send_message(payload)
 
     def list_by_request(self, request_id: str) -> MessageListResponse:
         query = urlencode({"requestId": request_id})
