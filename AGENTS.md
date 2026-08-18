@@ -110,7 +110,7 @@ error={"status":"VALIDATION_ERROR","message":"수신번호 검증 실패 사유"
 
 - 메시지 `type`은 `MMS`다.
 - 별도 `subject`는 넣지 않는다.
-- 본문을 임의로 수정하거나 문구를 자동 삽입하지 않는다.
+- 본문을 임의로 수정하거나 문구를 자동 삽입하지 않는다. 단, 2단계 분리 발송의 1단계 MMS 이미지 전송 시에는 필수 파라미터 제약 해결을 위해 content 필드를 공백 하나(" ")로 자동 설정한다.
 - 워크플로우 구현 또는 수정은 `MESSAGE_BODY`가 승인된 UTF-8 본문과 바이트 단위로 일치함을 정확한 동등성 자동 테스트가 확인한 경우에만 진행할 수 있다.
 - `contentType`의 광고성 여부가 확정되지 않았다면 실발송 전에 중단하고 사용자에게 확인한다.
 - 광고성 메시지로 분류된다면 관련 법령과 SENS 정책을 확인하고, 필요한 표시를 갖춘 별도 승인 문안 없이는 발송하지 않는다.
@@ -142,7 +142,7 @@ error={"status":"VALIDATION_ERROR","message":"수신번호 검증 실패 사유"
 - SENS가 한 요청에 여러 수신번호를 허용하더라도 배치 발송하지 않는다.
 - 수신번호별로 독립된 POST 요청을 만든다.
 - 각 요청의 `messages` 배열에는 `to` 한 건만 넣는다.
-- 각 요청은 `type="MMS"`, 사전 승인된 `contentType`, `countryCode="82"`, 승인된 `MESSAGE_BODY`, subject 없음, `messages=[{"to": "<한 수신번호>"}]`, `files=[{"fileId": intro}, {"fileId": details}]` 순서를 사용한다.
+- 각 요청은 `type="MMS"`, 사전 승인된 `contentType`, `countryCode="82"`, `" "` (공백 하나)의 content, subject 없음, `messages=[{"to": "<한 수신번호>"}]`, `files=[{"fileId": intro}, {"fileId": details}]` 순서를 사용한다. 단, 2단계 분리 발송의 2단계 LMS 발송 시에는 승인된 `MESSAGE_BODY`를 content로 사용한다.
 - POST API 호출 한 번을 발송 시도 한 번으로 계산한다.
 - POST 응답의 `statusCode="202"`는 요청 접수 성공일 뿐 최종 전송 성공이 아니다.
 - `202` 응답의 `requestId`를 즉시 결과 상태에 저장한다.

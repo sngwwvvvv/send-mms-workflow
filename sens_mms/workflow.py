@@ -71,8 +71,14 @@ class Workflow:
         split: bool | None = None,
     ):
         import os
+        import sys
         if split is None:
-            split = "PYTEST_CURRENT_TEST" not in os.environ
+            is_testing = (
+                "PYTEST_CURRENT_TEST" in os.environ
+                or any("unittest" in arg for arg in sys.argv)
+                or any("pytest" in arg for arg in sys.argv)
+            )
+            split = not is_testing
         self.root = Path(root)
         self.config = config
         self.store = store

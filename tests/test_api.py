@@ -749,7 +749,7 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(seen["request"].data, b"{}")
         self.assertEqual(seen["timeout"], 12.5)
 
-    def test_send_mms_builds_payload_with_files_and_empty_content(self):
+    def test_send_mms_builds_payload_with_files_and_space_content(self):
         transport = RecordingTransport([response(202, {
             "requestId": "request-1",
             "requestTime": "2026-08-13T10:00:00.000",
@@ -761,7 +761,7 @@ class ApiTests(unittest.TestCase):
         method, url, headers, body, _ = transport.calls[0]
         payload = json.loads(body)
         self.assertEqual(payload["type"], "MMS")
-        self.assertEqual(payload["content"], "")
+        self.assertEqual(payload["content"], " ")
         self.assertEqual(payload["files"], [{"fileId": "file-1"}, {"fileId": "file-2"}])
 
     def test_send_lms_builds_payload_with_content_and_no_files(self):

@@ -330,7 +330,7 @@ class SensClient:
                 "contentType": content_type,
                 "countryCode": "82",
                 "from": self._from_number,
-                "content": "",
+                "content": " ",
                 "messages": [{"to": to}],
                 "files": [{"fileId": file_id} for file_id in file_ids],
             }
