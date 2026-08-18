@@ -749,7 +749,7 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(seen["request"].data, b"{}")
         self.assertEqual(seen["timeout"], 12.5)
 
-    def test_send_mms_builds_payload_with_files_and_space_content(self):
+    def test_send_mms_builds_payload_with_files_and_default_content(self):
         transport = RecordingTransport([response(202, {
             "requestId": "request-1",
             "requestTime": "2026-08-13T10:00:00.000",
@@ -764,7 +764,22 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(payload["content"], " ")
         self.assertEqual(payload["files"], [{"fileId": "file-1"}, {"fileId": "file-2"}])
 
-    def test_send_lms_builds_payload_with_content_and_no_files(self):
+    def test_send_mms_builds_payload_with_files_and_custom_content(self):
+        transport = RecordingTransport([response(202, {
+            "requestId": "request-1",
+            "requestTime": "2026-08-13T10:00:00.000",
+            "statusCode": "202",
+            "statusName": "success",
+        })])
+        actual = client(transport).send_mms("01012345678", ("file-1", "file-2"), content_type="COMM", content="[개업소연 안내]")
+        self.assertEqual(actual.request_id, "request-1")
+        method, url, headers, body, _ = transport.calls[0]
+        payload = json.loads(body)
+        self.assertEqual(payload["type"], "MMS")
+        self.assertEqual(payload["content"], "[개업소연 안내]")
+        self.assertEqual(payload["files"], [{"fileId": "file-1"}, {"fileId": "file-2"}])
+
+    def test_send_lms_builds_payload_with_default_content_and_no_files(self):
         transport = RecordingTransport([response(202, {
             "requestId": "request-2",
             "requestTime": "2026-08-13T10:00:00.000",
@@ -778,6 +793,22 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(payload["type"], "LMS")
         self.assertEqual(payload["content"], MESSAGE_BODY)
         self.assertNotIn("files", payload)
+
+    def test_send_lms_builds_payload_with_custom_content_and_no_files(self):
+        transport = RecordingTransport([response(202, {
+            "requestId": "request-2",
+            "requestTime": "2026-08-13T10:00:00.000",
+            "statusCode": "202",
+            "statusName": "success",
+        })])
+        actual = client(transport).send_lms("01012345678", content_type="COMM", content="Custom LMS content")
+        self.assertEqual(actual.request_id, "request-2")
+        method, url, headers, body, _ = transport.calls[0]
+        payload = json.loads(body)
+        self.assertEqual(payload["type"], "LMS")
+        self.assertEqual(payload["content"], "Custom LMS content")
+        self.assertNotIn("files", payload)
+
 
 
 if __name__ == "__main__":

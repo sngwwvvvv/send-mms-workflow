@@ -321,6 +321,7 @@ class SensClient:
         file_ids: Sequence[str],
         *,
         content_type: str,
+        content: str = " ",
     ) -> SendResponse:
         if type(content_type) is not str or content_type not in {"COMM", "AD"}:
             raise ExplicitApiFailure("INVALID_REQUEST", "content type is invalid")
@@ -330,7 +331,7 @@ class SensClient:
                 "contentType": content_type,
                 "countryCode": "82",
                 "from": self._from_number,
-                "content": " ",
+                "content": content,
                 "messages": [{"to": to}],
                 "files": [{"fileId": file_id} for file_id in file_ids],
             }
@@ -341,6 +342,7 @@ class SensClient:
         to: str,
         *,
         content_type: str,
+        content: str = MESSAGE_BODY,
     ) -> SendResponse:
         if type(content_type) is not str or content_type not in {"COMM", "AD"}:
             raise ExplicitApiFailure("INVALID_REQUEST", "content type is invalid")
@@ -350,7 +352,7 @@ class SensClient:
                 "contentType": content_type,
                 "countryCode": "82",
                 "from": self._from_number,
-                "content": MESSAGE_BODY,
+                "content": content,
                 "messages": [{"to": to}],
             }
         )
