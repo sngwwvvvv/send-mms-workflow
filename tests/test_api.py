@@ -1,4 +1,4 @@
-import base64
+﻿import base64
 import json
 import socket
 import tempfile
@@ -14,7 +14,7 @@ from sens_mms.api import (
     UrlLibTransport,
     make_signature,
 )
-from sens_mms.inputs import MESSAGE_BODY
+from sens_mms.inputs import MESSAGE_BODY, MESSAGE_CONTENT, MESSAGE_SUBJECT
 
 
 class RecordingTransport:
@@ -107,11 +107,11 @@ class ApiTests(unittest.TestCase):
             "contentType": "COMM",
             "countryCode": "82",
             "from": "0212345678",
-            "content": MESSAGE_BODY,
+            "content": MESSAGE_CONTENT,
             "messages": [{"to": "01012345678"}],
             "files": [{"fileId": "file-1"}, {"fileId": "file-2"}],
+            "subject": MESSAGE_SUBJECT,
         })
-        self.assertNotIn("subject", payload)
         self.assertEqual(headers["x-ncp-apigw-timestamp"], "1700000000000")
 
     def test_send_one_accepts_exact_ad_content_type(self):
@@ -262,7 +262,7 @@ class ApiTests(unittest.TestCase):
                 self.assertNotIn(marker, repr(raised.exception))
 
     def test_two_xx_send_malformed_string_status_code_is_ambiguous(self):
-        malformed = ("", " ", "abc", "20", "0202", "２０２")
+        malformed = ("", " ", "abc", "20", "0202", "202A")
         for status_code in malformed:
             with self.subTest(status_code=repr(status_code)):
                 transport = RecordingTransport([response(200, {
@@ -761,7 +761,8 @@ class ApiTests(unittest.TestCase):
         method, url, headers, body, _ = transport.calls[0]
         payload = json.loads(body)
         self.assertEqual(payload["type"], "MMS")
-        self.assertEqual(payload["content"], " ")
+        self.assertEqual(payload["content"], MESSAGE_CONTENT)
+        self.assertEqual(payload["subject"], MESSAGE_SUBJECT)
         self.assertEqual(payload["files"], [{"fileId": "file-1"}, {"fileId": "file-2"}])
 
     def test_send_mms_builds_payload_with_files_and_custom_content(self):
@@ -771,12 +772,12 @@ class ApiTests(unittest.TestCase):
             "statusCode": "202",
             "statusName": "success",
         })])
-        actual = client(transport).send_mms("01012345678", ("file-1", "file-2"), content_type="COMM", content="[개업소연 안내]")
+        actual = client(transport).send_mms("01012345678", ("file-1", "file-2"), content_type="COMM", content="[媛쒖뾽?뚯뿰 ?덈궡]")
         self.assertEqual(actual.request_id, "request-1")
         method, url, headers, body, _ = transport.calls[0]
         payload = json.loads(body)
         self.assertEqual(payload["type"], "MMS")
-        self.assertEqual(payload["content"], "[개업소연 안내]")
+        self.assertEqual(payload["content"], "[媛쒖뾽?뚯뿰 ?덈궡]")
         self.assertEqual(payload["files"], [{"fileId": "file-1"}, {"fileId": "file-2"}])
 
     def test_send_lms_builds_payload_with_default_content_and_no_files(self):
@@ -820,14 +821,14 @@ class ApiTests(unittest.TestCase):
             "01012345678",
             ("file-1", "file-2"),
             content_type="COMM",
-            content="[개업소연 안내]",
+            content="[媛쒖뾽?뚯뿰 ?덈궡]",
             subject="Test Subject",
         )
         self.assertEqual(actual.request_id, "request-1")
         method, url, headers, body, _ = transport.calls[0]
         payload = json.loads(body)
         self.assertEqual(payload["type"], "MMS")
-        self.assertEqual(payload["content"], "[개업소연 안내]")
+        self.assertEqual(payload["content"], "[媛쒖뾽?뚯뿰 ?덈궡]")
         self.assertEqual(payload["subject"], "Test Subject")
         self.assertEqual(payload["files"], [{"fileId": "file-1"}, {"fileId": "file-2"}])
 
@@ -855,3 +856,6 @@ class ApiTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+

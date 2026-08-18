@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo
 
 from sens_mms.api import ApiResponse, make_signature
 from sens_mms.event_log import EventLogError, create_event_log
-from sens_mms.inputs import MESSAGE_BODY
+from sens_mms.inputs import MESSAGE_BODY, MESSAGE_CONTENT, MESSAGE_SUBJECT
 from sens_mms.preflight import build_preflight
 from sens_mms.results import ResultRow, ResultStore
 import sens_mms_cli
@@ -342,7 +342,6 @@ def success_responses(recipient=RECIPIENT, request_id=REQUEST_1, message_id=MESS
     )
     return [
         api_response(200, {"fileId": FILE_1}),
-        api_response(200, {"fileId": FILE_2}),
         api_response(
             202,
             {
@@ -664,11 +663,11 @@ class CliTests(unittest.TestCase):
         ]
         self.assertEqual(len(message_posts), 1)
         payload = json.loads(message_posts[0][3].decode("utf-8"))
-        self.assertEqual(payload["content"].encode("utf-8"), MESSAGE_BODY.encode("utf-8"))
+        self.assertEqual(payload["content"].encode("utf-8"), MESSAGE_CONTENT.encode("utf-8"))
         self.assertEqual(payload["contentType"], "COMM")
         self.assertEqual(payload["messages"], [{"to": RECIPIENT}])
-        self.assertEqual(payload["files"], [{"fileId": FILE_1}, {"fileId": FILE_2}])
-        self.assertNotIn("subject", payload)
+        self.assertEqual(payload["files"], [{"fileId": FILE_1}])
+        self.assertEqual(payload["subject"], MESSAGE_SUBJECT)
 
     def test_preflight_creates_no_event_log_and_never_calls_network(self):
         root = make_root((RECIPIENT, SECOND))
@@ -1045,14 +1044,14 @@ class CliTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual((current.delivery_status, current.attempts), ("SENT", 2))
         self.assertEqual(current.delivery_id, PENDING_ID)
-        self.assertEqual(len(transport.calls), 6)
+        self.assertEqual(len(transport.calls), 5)
         self.assertEqual(
             [
                 urlparse(call[1]).path.rsplit("/", 1)[-1]
                 for call in transport.calls
                 if urlparse(call[1]).path.endswith("/files")
             ],
-            ["files", "files"],
+            ["files"],
         )
         self.assert_public_safe(public, "private failure detail")
 
@@ -1224,7 +1223,7 @@ class CliTests(unittest.TestCase):
             if call[0] == "POST" and urlparse(call[1]).path.endswith("/messages")
         ]
         lookup_calls = [call for call in transport.calls if call[0] == "GET"]
-        self.assertEqual(len(upload_calls), 2)
+        self.assertEqual(len(upload_calls), 1)
         self.assertGreaterEqual(len(send_calls), 1)
         self.assertLessEqual(len(send_calls), 2)
         sent_numbers = [
@@ -1370,7 +1369,7 @@ class CliTests(unittest.TestCase):
         self.assertTrue({OLD_ID_1, OLD_ID_2}.isdisjoint({NEW_ID_1, NEW_ID_2}))
         for number in ("01011112222", "not-a-number", "01055556666"):
             self.assertEqual(after[number], before[number])
-        self.assertEqual(len(transport.calls), 11)
+        self.assertEqual(len(transport.calls), 10)
         message_posts = [
             call
             for call in transport.calls

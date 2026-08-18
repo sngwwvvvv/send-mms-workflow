@@ -5,7 +5,13 @@ import hashlib, json
 from typing import Literal
 
 from .coordination import RUN_SETTINGS
-from .inputs import load_recipients, validate_images, MESSAGE_BODY
+from .inputs import (
+    MESSAGE_BODY,
+    MESSAGE_CONTENT,
+    MESSAGE_SUBJECT,
+    load_recipients,
+    validate_images,
+)
 from .results import (
     ResultFormatError,
     ResultRow,
@@ -43,6 +49,8 @@ class PreflightReport:
     masked_samples: tuple
     sender: str
     body: str
+    subject: str
+    content: str
     content_type: str
     images: tuple
     approved_images: tuple = field(repr=False)
@@ -100,8 +108,9 @@ class PreflightReport:
             ),
             "sender": self.sender,
             "body": self.body,
+            "subject": self.subject,
+            "content": self.content,
             "type": "MMS",
-            "subject": None,
             "contentType": self.content_type,
             "images": self.images,
             "settings": {
@@ -286,8 +295,9 @@ def build_preflight(root, config, result_store, *, resend_failed=False):
     canonical = {
         "sender": config.from_number,
         "body": MESSAGE_BODY,
+        "subject": MESSAGE_SUBJECT,
+        "content": MESSAGE_CONTENT,
         "type": "MMS",
-        "subject": None,
         "contentType": APPROVED_CONTENT_TYPE,
         "images": [
             {
@@ -338,6 +348,8 @@ def build_preflight(root, config, result_store, *, resend_failed=False):
         masked_samples=tuple(mask_number(n) for n in eligible[:3]),
         sender=config.from_number,
         body=MESSAGE_BODY,
+        subject=MESSAGE_SUBJECT,
+        content=MESSAGE_CONTENT,
         content_type=APPROVED_CONTENT_TYPE,
         images=image_data,
         approved_images=images,

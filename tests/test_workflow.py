@@ -1,4 +1,4 @@
-import csv
+﻿import csv
 from dataclasses import replace
 from datetime import datetime, timedelta
 import io
@@ -25,7 +25,7 @@ from sens_mms.api import (
 from sens_mms.config import Config
 from sens_mms.coordination import RUN_SETTINGS, RunCoordinator
 from sens_mms.event_log import EventLogError, JsonlEventLog
-from sens_mms.inputs import MESSAGE_BODY, split_message_body
+from sens_mms.inputs import MESSAGE_BODY
 from sens_mms.preflight import canonical_result_state
 from sens_mms.results import ResultFormatError, ResultRow, ResultStore
 from sens_mms.workflow import Workflow
@@ -60,7 +60,6 @@ def make_root(numbers=(RECIPIENT,)):
     image_dir = root / "mms_img"
     image_dir.mkdir()
     (image_dir / "mms_01_intro.jpg").write_bytes(tiny_jpeg())
-    (image_dir / "mms_02_details.jpg").write_bytes(tiny_jpeg())
     return root
 
 
@@ -260,7 +259,7 @@ class ScriptedApi:
         self.uploaded.append(name)
         return f"file-{len(self.uploaded)}"
 
-    def send_one(self, to, file_ids, *, content_type, subject=None):
+    def send_one(self, to, file_ids, *, content_type, content=None, subject=None):
         self.sent.append((to, tuple(file_ids)))
         self.sent_content_types.append(content_type)
         if self.on_send is not None:
@@ -506,7 +505,7 @@ class OrchestrationApi:
             self._on_upload(upload_number)
         return f"file-{upload_number}"
 
-    def send_one(self, to, file_ids, *, content_type, subject=None):
+    def send_one(self, to, file_ids, *, content_type, content=None, subject=None):
         self._record_thread(to)
         wait_at_barrier = False
         with self._lock:
@@ -770,7 +769,6 @@ def make_workflow(
     delivery_id_factory=None,
     *,
     resend_failed=False,
-    split=False,
 ):
     return Workflow(
         root,
@@ -782,7 +780,6 @@ def make_workflow(
         delivery_id_factory
         or FixedIdFactory(DELIVERY_ID_1, DELIVERY_ID_2, DELIVERY_ID_3),
         resend_failed=resend_failed,
-        split=split,
     )
 
 
@@ -997,7 +994,7 @@ class WorkflowTests(unittest.TestCase):
             api.index(f"{pending_number}:get:done"),
             api.index("upload:1"),
         )
-        self.assertLess(api.index("upload:2"), api.index(f"{new_number}:send"))
+        self.assertLess(api.index("upload:1"), api.index(f"{new_number}:send"))
 
     def test_absent_pending_reconciles_before_new_input_and_cannot_auto_retry(self):
         """Catches CSV membership dropping durable reconciliation or authorizing resend."""
@@ -1040,7 +1037,7 @@ class WorkflowTests(unittest.TestCase):
                     api.index("upload:1"),
                 )
                 self.assertLess(
-                    api.index("upload:2"),
+                    api.index("upload:1"),
                     api.index(f"{new_number}:send"),
                 )
 
@@ -1081,7 +1078,7 @@ class WorkflowTests(unittest.TestCase):
 
     def test_pending_explicit_failure_uploads_only_when_retry_is_approved(self):
         """Catches retrying exhausted failures or skipping an approved retry."""
-        for attempts, expected_uploads, expected_sends in ((1, 2, 1), (3, 0, 0)):
+        for attempts, expected_uploads, expected_sends in ((1, 1, 1), (3, 0, 0)):
             with self.subTest(attempts=attempts):
                 number = "01000000004"
                 root = make_root((number,))
@@ -1145,7 +1142,7 @@ class WorkflowTests(unittest.TestCase):
         summary = workflow.run_live(workflow.current_token())
 
         self.assertEqual(summary.sent, 1)
-        self.assertEqual(clock.sleeps, [3.5, 3.5, 3.0])
+        self.assertEqual(clock.sleeps, [3.5, 6.5])
         self.assertEqual(clock.monotonic(), 10)
 
     def test_retry_rejects_any_reconciled_row_change_during_upload(self):
@@ -1195,7 +1192,7 @@ class WorkflowTests(unittest.TestCase):
                 ):
                     workflow.run_live(workflow.current_token())
 
-                self.assertEqual(len(api.uploaded), 2)
+                self.assertEqual(len(api.uploaded), 1)
                 self.assertEqual(api.sent, [])
                 self.assertEqual(ResultStore.for_root(root).load()[number], changed)
 
@@ -1205,11 +1202,6 @@ class WorkflowTests(unittest.TestCase):
             (
                 (ExplicitApiFailure("500", "first upload failed", http_status=500),),
                 1,
-                0,
-            ),
-            (
-                (None, ExplicitApiFailure("500", "second upload failed", http_status=500)),
-                2,
                 0,
             ),
             (
@@ -1387,14 +1379,14 @@ class WorkflowTests(unittest.TestCase):
         )
         self.assertEqual(
             {call[1] for call in api.sent},
-            {("file-1", "file-2")},
+            {("file-1",)},
         )
         self.assertTrue(all(call[2] == "COMM" for call in api.sent))
         first_send = min(
             api.index(f"{number}:send")
             for number in (failed_number, resume_number, retry_number)
         )
-        self.assertLess(api.index("upload:2"), first_send)
+        self.assertLess(api.index("upload:1"), first_send)
         assigned_before_send = [
             fields["delivery_id"]
             for event, fields in log.events
@@ -1432,7 +1424,7 @@ class WorkflowTests(unittest.TestCase):
         with self.assertRaisesRegex(ResultFormatError, "duplicate"):
             workflow.run_live(workflow.current_token())
 
-        self.assertEqual(len(api.uploaded), 2)
+        self.assertEqual(len(api.uploaded), 1)
         self.assertEqual(api.sent, [])
 
     def test_reconcile_and_send_phases_each_use_five_workers_with_thread_ownership(self):
@@ -1720,7 +1712,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertNotIn(list_marker, durable)
 
     def test_real_api_malformed_send_status_stays_pending_without_retry_or_marker(self):
-        malformed = ("", " ", "abc", "20", "0202", "２０２")
+        malformed = ("", " ", "abc", "20", "0202", "202A")
         for status_code in malformed:
             with self.subTest(status_code=repr(status_code)):
                 root = make_root()
@@ -2047,7 +2039,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertIs(raised.exception, failure)
         self.assertEqual(len(archives), 1)
         self.assertEqual(next(iter(archives)).read_bytes(), checkpoint_bytes)
-        self.assertEqual(archive_seen_at_upload, [True, True])
+        self.assertEqual(archive_seen_at_upload, [True])
         self.assertEqual(api.sent, [])
         self.assertEqual(
             next(
@@ -2290,7 +2282,7 @@ class WorkflowTests(unittest.TestCase):
                 self.assertEqual(store.path.read_bytes(), mutation_payload[0])
                 self.assertEqual(
                     (api.uploaded, api.sent, api.listed_requests, api.time_listed, api.got),
-                    (["mms_01_intro.jpg", "mms_02_details.jpg"], [], [], [], []),
+                    (["mms_01_intro.jpg"], [], [], [], []),
                 )
                 self.assertEqual(
                     [event for event, _ in log.events],
@@ -2665,8 +2657,8 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual((summary.sent, summary.failed, summary.pending), (1, 0, 0))
         self.assertEqual((row.delivery_status, row.is_sent, row.attempts), ("SENT", "true", 1))
         self.assertEqual((row.request_id, row.message_id, row.error), ("request-1", "message-1", None))
-        self.assertEqual(api.uploaded, ["mms_01_intro.jpg", "mms_02_details.jpg"])
-        self.assertEqual(api.sent, [(RECIPIENT, ("file-1", "file-2"))])
+        self.assertEqual(api.uploaded, ["mms_01_intro.jpg"])
+        self.assertEqual(api.sent, [(RECIPIENT, ("file-1",))])
         self.assertEqual(clock.sleeps, [1])
 
     def test_explicit_post_failure_retries_after_ten_seconds_then_succeeds(self):
@@ -2849,13 +2841,13 @@ class WorkflowTests(unittest.TestCase):
         )
         self.assertEqual(
             [name for name, _data in api.uploaded],
-            ["mms_01_intro.jpg", "mms_02_details.jpg"],
+            ["mms_01_intro.jpg"],
         )
         self.assertEqual(
             {(number, files) for number, files, _content_type in api.sent},
             {
-                (RECIPIENT, ("file-1", "file-2")),
-                (second, ("file-1", "file-2")),
+                (RECIPIENT, ("file-1",)),
+                (second, ("file-1",)),
             },
         )
 
@@ -3599,7 +3591,7 @@ class WorkflowTests(unittest.TestCase):
         final = ResultStore.for_root(root).load()[RECIPIENT]
         self.assertEqual((summary.sent, final.delivery_status), (1, "SENT"))
         self.assertEqual(final.delivery_id, DELIVERY_ID_1)
-        self.assertEqual(len(api.uploaded), 2)
+        self.assertEqual(len(api.uploaded), 1)
         self.assertEqual(len(api.sent), 1)
 
     def test_workflow_started_log_failure_makes_zero_api_calls_and_no_snapshot(self):
@@ -3786,66 +3778,10 @@ class WorkflowTests(unittest.TestCase):
 
         self.assertEqual((api.uploaded, api.sent), ([], []))
 
-    def test_workflow_split_dispatch_success(self):
-        root = make_root()
-        api = ScriptedSplitApi(
-            sends=[
-                SendResponse(202, "mms-req", "2026-08-18T10:00:00.000", "202", "success"),
-                SendResponse(202, "lms-req", "2026-08-18T10:00:00.000", "202", "success"),
-            ],
-            lists=[
-                list_response(MessageRecord("mms-req", "mms-msg", RECIPIENT, "2026-08-18 10:00:00", "2026-08-18 10:00:01", "SKT", "PROCESSING", "0", "success", "", "MMS")),
-                list_response(MessageRecord("lms-req", "lms-msg", RECIPIENT, "2026-08-18 10:00:00", "2026-08-18 10:00:01", "SKT", "PROCESSING", "0", "success", "", "LMS")),
-            ],
-            gets=[
-                result_response(MessageRecord("mms-req", "mms-msg", RECIPIENT, "2026-08-18 10:00:00", "2026-08-18 10:00:01", "SKT", "COMPLETED", "0", "success", "", "MMS")),
-                result_response(MessageRecord("lms-req", "lms-msg", RECIPIENT, "2026-08-18 10:00:00", "2026-08-18 10:00:01", "SKT", "COMPLETED", "0", "success", "", "LMS")),
-            ],
-        )
-        workflow = make_workflow(root, ResultStore.for_root(root), api, split=True)
-        summary = workflow.run_live(workflow.current_token())
-
-        self.assertEqual((summary.sent, summary.failed, summary.pending), (1, 0, 0))
-        self.assertEqual(len(api.uploaded), 2)
-        self.assertEqual(
-            api.sent,
-            [
-                (RECIPIENT, ("file-1", "file-2"), "MMS", ".", None),
-                (
-                    RECIPIENT,
-                    (),
-                    "LMS",
-                    "[개업소연 안내]\n\n"
-                    "안녕하세요.\n"
-                    "국세청에서의 오랜 경험을 바탕으로 호연회계법인에서 새로운 출발을 하게 된 윤성중 세무사입니다.\n\n"
-                    "그동안 보내주신 관심에 감사드리며, 앞으로도 많은 응원과 격려 부탁드립니다.\n\n"
-                    "뜻깊은 시작을 기쁜 마음으로 함께해 주시면 감사하겠습니다.",
-                    None,
-                ),
-            ]
-        )
-
-        # Check result row
-        rows = ResultStore.for_root(root).load()
-        row = rows[RECIPIENT]
-        self.assertEqual(row.delivery_status, "SENT")
-        self.assertEqual(row.is_sent, "true")
-        self.assertEqual(row.attempts, 1) # LMS attempts
-        self.assertEqual(row.request_id, "lms-req")
-        self.assertEqual(row.message_id, "lms-msg")
-
-
-class ScriptedSplitApi(ScriptedApi):
-    def send_mms(self, to, file_ids, *, content_type, content=" ", subject=None):
-        self.sent.append((to, tuple(file_ids), "MMS", content, subject))
-        self.sent_content_types.append(content_type)
-        return self.sends.pop(0)
-
-    def send_lms(self, to, *, content_type, content=MESSAGE_BODY, subject=None):
-        self.sent.append((to, (), "LMS", content, subject))
-        self.sent_content_types.append(content_type)
-        return self.sends.pop(0)
-
-
 if __name__ == "__main__":
     unittest.main()
+
+
+
+
+

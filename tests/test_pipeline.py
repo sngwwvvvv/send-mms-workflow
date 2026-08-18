@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from dataclasses import replace
 from datetime import datetime
@@ -20,7 +20,7 @@ from sens_mms.coordination import RunCoordinator, RunSafetyError
 from sens_mms.pipeline import PipelineResult, RecipientPipeline
 from sens_mms.preflight import ApprovedWork
 from sens_mms.results import ResultFormatError, ResultRow, ResultStore
-from sens_mms.inputs import MESSAGE_BODY, split_message_body
+from sens_mms.inputs import MESSAGE_BODY
 
 
 NUMBER = "01000000001"
@@ -142,14 +142,14 @@ class SharedFailureApi:
         self._lock = threading.Lock()
         self.unrelated_called = threading.Event()
 
-    def send_one(self, to, file_ids, *, content_type, subject=None):
+    def send_one(self, to, file_ids, *, content_type, content=None, subject=None):
         with self._lock:
             self.calls.append((to, self.clock.monotonic()))
         if threading.current_thread().name == "unrelated-worker":
             self.unrelated_called.set()
         raise ExplicitApiFailure("400", "fixed fake failure", http_status=400)
 
-    def send_mms(self, to, file_ids, *, content_type, content=" ", subject=None):
+    def send_mms(self, to, file_ids, *, content_type, content=None, subject=None):
         return self.send_one(to, file_ids, content_type=content_type)
 
     def send_lms(self, to, *, content_type, content=MESSAGE_BODY, subject=None):
@@ -175,11 +175,11 @@ class ScriptedPipelineApi:
             raise item
         return item
 
-    def send_one(self, to, file_ids, *, content_type, subject=None):
+    def send_one(self, to, file_ids, *, content_type, content=None, subject=None):
         self.calls.append(("send", to, tuple(file_ids), content_type))
         return self._next(self.sends)
 
-    def send_mms(self, to, file_ids, *, content_type, content=" ", subject=None):
+    def send_mms(self, to, file_ids, *, content_type, content=None, subject=None):
         self.calls.append(("send_mms", to, tuple(file_ids), content_type, content, subject))
         return self._next(self.sends)
 
@@ -210,11 +210,11 @@ class TimestampingPipelineApi(ScriptedPipelineApi):
         self.clock = clock
         self.send_times = []
 
-    def send_one(self, to, file_ids, *, content_type, subject=None):
+    def send_one(self, to, file_ids, *, content_type, content=None, subject=None):
         self.send_times.append(self.clock.monotonic())
         return super().send_one(to, file_ids, content_type=content_type, subject=subject)
 
-    def send_mms(self, to, file_ids, *, content_type, content=" ", subject=None):
+    def send_mms(self, to, file_ids, *, content_type, content=None, subject=None):
         self.send_times.append(self.clock.monotonic())
         return super().send_mms(to, file_ids, content_type=content_type, content=content, subject=subject)
 
@@ -297,7 +297,7 @@ class PipelineTests(unittest.TestCase):
         self.addCleanup(self.directory.cleanup)
         self.path = Path(self.directory.name) / "results" / "result.csv"
 
-    def make_pipeline(self, api, row, *, event_log=None, store=None, split=False):
+    def make_pipeline(self, api, row, *, event_log=None, store=None):
         base = ResultStore(self.path)
         base.upsert(row)
         base.write_atomic()
@@ -305,7 +305,7 @@ class PipelineTests(unittest.TestCase):
         clock = ManualClock()
         log = event_log or RecordingEventLog()
         coordinator = RunCoordinator(store, log, clock)
-        return RecipientPipeline(api, coordinator, content_type="COMM", split=split), clock, log, coordinator
+        return RecipientPipeline(api, coordinator, content_type="COMM"), clock, log, coordinator
 
     def persisted(self):
         return ResultStore(self.path).load()[NUMBER]
@@ -1094,100 +1094,8 @@ class PipelineTests(unittest.TestCase):
         with self.assertRaisesRegex(ResultFormatError, "approved work recipient mismatch"):
             pipeline.run(row, mismatched, ("file-1", "file-2"))
         self.assertEqual(api.calls, [])
-
-    def test_split_dispatch_two_stage_success(self):
-        """Verify that split dispatch uses the split-mode MMS and LMS payload contract."""
-        api = ScriptedPipelineApi(
-            sends=(
-                send_response(request_id="mms-req"),
-                send_response(request_id="lms-req"),
-            ),
-            lists=(
-                list_response(message("PROCESSING", request_id="mms-req", message_id="mms-msg")),
-                list_response(message("PROCESSING", request_id="lms-req", message_id="lms-msg", message_type="LMS")),
-            ),
-            gets=(
-                result_response(message("COMPLETED", "success", request_id="mms-req", message_id="mms-msg")),
-                result_response(message("COMPLETED", "success", request_id="lms-req", message_id="lms-msg", message_type="LMS")),
-            ),
-        )
-        pipeline, clock, log, _ = self.make_pipeline(api, reservation(), split=True)
-        result = pipeline.run(reservation(), work(), ("file-1", "file-2"))
-
-        self.assertEqual(result.row.delivery_status, "SENT")
-        self.assertEqual(result.row.is_sent, "true")
-        self.assertEqual(result.row.attempts, 1) # LMS attempts
-        self.assertEqual(result.row.request_id, "lms-req")
-        self.assertEqual(result.row.message_id, "lms-msg")
-        
-        self.assertEqual(
-            [call[0] for call in api.calls],
-            ["send_mms", "list", "get", "send_lms", "list", "get"]
-        )
-        self.assertEqual(
-            api.calls[0][2:],
-            (("file-1", "file-2"), "COMM", ".", None),
-        )
-        self.assertEqual(
-            api.calls[3][2:],
-            (
-                "COMM",
-                "[개업소연 안내]\n\n"
-                "안녕하세요.\n"
-                "국세청에서의 오랜 경험을 바탕으로 호연회계법인에서 새로운 출발을 하게 된 윤성중 세무사입니다.\n\n"
-                "그동안 보내주신 관심에 감사드리며, 앞으로도 많은 응원과 격려 부탁드립니다.\n\n"
-                "뜻깊은 시작을 기쁜 마음으로 함께해 주시면 감사하겠습니다.",
-                None,
-            ),
-        )
-
-    def test_split_dispatch_reconciliation_mms_success(self):
-        """Verify that reconciliation resolves a successful MMS stage and automatically launches the LMS stage."""
-        api = ScriptedPipelineApi(
-            sends=(
-                send_response(request_id="lms-req"),
-            ),
-            lists=(
-                list_response(message("PROCESSING", request_id="lms-req", message_id="lms-msg", message_type="LMS")),
-            ),
-            gets=(
-                result_response(message("COMPLETED", "success", request_id="mms-req", message_id="mms-msg", message_type="MMS")),
-                result_response(message("COMPLETED", "success", request_id="lms-req", message_id="lms-msg", message_type="LMS")),
-            ),
-        )
-        row = replace(
-            reservation(),
-            delivery_status="PENDING_CONFIRMATION",
-            attempts=1,
-            request_id="mms-req",
-            message_id="mms-msg",
-        )
-        pipeline, clock, log, _ = self.make_pipeline(api, row, split=True)
-        result = pipeline.run(row, work("RECONCILE", True))
-
-        self.assertEqual(result.row.delivery_status, "SENT")
-        self.assertEqual(result.row.is_sent, "true")
-        self.assertEqual(result.row.attempts, 1) # LMS attempts
-        self.assertEqual(result.row.request_id, "lms-req")
-        self.assertEqual(result.row.message_id, "lms-msg")
-
-        self.assertEqual(
-            [call[0] for call in api.calls],
-            ["get", "send_lms", "list", "get"]
-        )
-        self.assertEqual(
-            api.calls[1][2:],
-            (
-                "COMM",
-                "[개업소연 안내]\n\n"
-                "안녕하세요.\n"
-                "국세청에서의 오랜 경험을 바탕으로 호연회계법인에서 새로운 출발을 하게 된 윤성중 세무사입니다.\n\n"
-                "그동안 보내주신 관심에 감사드리며, 앞으로도 많은 응원과 격려 부탁드립니다.\n\n"
-                "뜻깊은 시작을 기쁜 마음으로 함께해 주시면 감사하겠습니다.",
-                None,
-            ),
-        )
-
-
 if __name__ == "__main__":
     unittest.main()
+
+
+

@@ -68,17 +68,7 @@ class Workflow:
         delivery_id_factory,
         *,
         resend_failed: bool = False,
-        split: bool | None = None,
     ):
-        import os
-        import sys
-        if split is None:
-            is_testing = (
-                "PYTEST_CURRENT_TEST" in os.environ
-                or any("unittest" in arg for arg in sys.argv)
-                or any("pytest" in arg for arg in sys.argv)
-            )
-            split = not is_testing
         self.root = Path(root)
         self.config = config
         self.store = store
@@ -87,7 +77,6 @@ class Workflow:
         self.event_log = event_log
         self.delivery_id_factory = delivery_id_factory
         self.resend_failed = resend_failed
-        self.split = split
         self.coordinator = RunCoordinator(store, event_log, clock)
         self._pipeline: RecipientPipeline | None = None
 
@@ -132,7 +121,6 @@ class Workflow:
             self.api,
             self.coordinator,
             report.content_type,
-            split=self.split,
         )
         self._record_validation_failures()
 
@@ -302,8 +290,8 @@ class Workflow:
     def _upload_approved_images(
         self,
         report: PreflightReport,
-    ) -> tuple[str, str]:
-        if len(report.approved_images) != 2:
+    ) -> tuple[str, ...]:
+        if len(report.approved_images) != 1:
             raise ResultFormatError("approved image count invalid")
         file_ids = []
         for image in report.approved_images:
@@ -318,7 +306,7 @@ class Workflow:
                 self._record_upload_failure(failure)
                 raise failure
             file_ids.append(file_id)
-        return file_ids[0], file_ids[1]
+        return tuple(file_ids)
 
     def _record_upload_failure(self, failure: Exception) -> None:
         http_status = None

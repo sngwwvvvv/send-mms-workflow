@@ -1,4 +1,4 @@
-import base64
+﻿import base64
 import csv
 import hashlib
 import json
@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 from sens_mms.config import Config
 from sens_mms.coordination import RUN_SETTINGS
-from sens_mms.inputs import ImageInfo, MESSAGE_BODY
+from sens_mms.inputs import ImageInfo, MESSAGE_BODY, MESSAGE_CONTENT, MESSAGE_SUBJECT
 from sens_mms.preflight import ApprovedWork, PreflightReport, build_preflight
 from sens_mms.results import (
     ResultFormatError,
@@ -25,12 +25,18 @@ FIRST = "01011111111"
 SECOND = "01022222222"
 THIRD = "01033333333"
 VALID_DELIVERY_ID = "23456789ABCDEFGH"
-EXPECTED_BODY = """안녕하세요.
+EXPECTED_SUBJECT = "[개업소연 안내]"
+EXPECTED_CONTENT = """안녕하세요.
 국세청에서의 오랜 경험을 바탕으로 호연회계법인에서 새로운 출발을 하게 된 윤성중 세무사입니다.
 
 그동안 보내주신 관심에 감사드리며, 앞으로도 많은 응원과 격려 부탁드립니다.
 
-뜻깊은 시작을 기쁜 마음으로 함께해 주시면 감사하겠습니다."""
+뜻깊은 시작을 기쁜 마음으로 함께해 주시면 감사하겠습니다.
+
+아래 링크를 클릭하여 내용을 확인해주세요.
+
+https://sngwwvvvv.github.io/invitation-design-ysj/"""
+EXPECTED_BODY = f"{EXPECTED_SUBJECT}\n\n{EXPECTED_CONTENT}"
 
 
 def jpeg(comment_byte=b"A"):
@@ -49,9 +55,7 @@ def root_with_inputs(numbers=(FIRST,)):
     images = root / "mms_img"
     images.mkdir()
     (images / "mms_01_intro.jpg").write_bytes(jpeg(b"A"))
-    (images / "mms_02_details.jpg").write_bytes(jpeg(b"B"))
     return root
-
 
 def config():
     return Config("access", "secret", "service", "0212345678", "COMM")
@@ -147,7 +151,7 @@ def validation_failure_row(number):
         request_id="",
         message_id="",
         error_status="VALIDATION_ERROR",
-        error_message="수신번호 검증 실패",
+        error_message="?섏떊踰덊샇 寃利??ㅽ뙣",
     )
 
 
@@ -382,9 +386,11 @@ class PreflightTests(unittest.TestCase):
 
         self.assertEqual(MESSAGE_BODY, EXPECTED_BODY)
         self.assertEqual(public["body"], EXPECTED_BODY)
+        self.assertEqual(public["subject"], EXPECTED_SUBJECT)
+        self.assertEqual(public["content"], EXPECTED_CONTENT)
         self.assertEqual(public["sender"], "0212345678")
         self.assertEqual(public["type"], "MMS")
-        self.assertIsNone(public["subject"])
+        self.assertEqual(public["subject"], EXPECTED_SUBJECT)
         self.assertEqual(public["contentType"], "COMM")
         self.assertEqual(
             public["settings"],
@@ -416,19 +422,11 @@ class PreflightTests(unittest.TestCase):
                     "height": 10,
                     "sha256": hashlib.sha256(jpeg(b"A")).hexdigest(),
                 },
-                {
-                    "order": 2,
-                    "name": "mms_02_details.jpg",
-                    "bytes": len(jpeg(b"B")),
-                    "width": 10,
-                    "height": 10,
-                    "sha256": hashlib.sha256(jpeg(b"B")).hexdigest(),
-                },
             ),
         )
         self.assertEqual(
             tuple(image.data for image in report.approved_images),
-            (jpeg(b"A"), jpeg(b"B")),
+            (jpeg(b"A"),),
         )
 
     def test_public_report_never_emits_private_identifiers(self):
@@ -470,6 +468,8 @@ class PreflightTests(unittest.TestCase):
 
         self.assertEqual(MESSAGE_BODY, EXPECTED_BODY)
         self.assertEqual(public["body"], EXPECTED_BODY)
+        self.assertEqual(public["subject"], EXPECTED_SUBJECT)
+        self.assertEqual(public["content"], EXPECTED_CONTENT)
         self.assertEqual(public["sender"], "0212345678")
         self.assertEqual(public["masked_samples"], ("*******1111",))
         self.assertEqual(public["mode"], "normal")
@@ -579,18 +579,11 @@ class PreflightTests(unittest.TestCase):
             with self.subTest(image=mutated_first_image):
                 with patch(
                     "sens_mms.preflight.validate_images",
-                    return_value=(mutated_first_image, original_images[1]),
+                    return_value=(mutated_first_image,),
                 ):
                     changed = build_preflight(root, config(), store)
 
                 self.assertNotEqual(first.approval_token, changed.approval_token)
-
-        with patch(
-            "sens_mms.preflight.validate_images",
-            return_value=(original_images[1], original_images[0]),
-        ):
-            reordered = build_preflight(root, config(), store)
-        self.assertNotEqual(first.approval_token, reordered.approval_token)
 
     def test_token_changes_when_approved_content_type_changes(self):
         root = root_with_inputs((FIRST,))
@@ -618,7 +611,7 @@ class PreflightTests(unittest.TestCase):
 
         self.assertEqual(
             reads,
-            ["mms_01_intro.jpg", "mms_02_details.jpg"],
+            ["mms_01_intro.jpg"],
         )
 
     def test_preflight_keeps_approved_bytes_internal_and_hashes_that_copy(self):
@@ -1053,3 +1046,5 @@ class PreflightTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+

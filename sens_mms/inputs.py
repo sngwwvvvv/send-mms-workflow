@@ -2,12 +2,18 @@ from dataclasses import dataclass
 from pathlib import Path
 import csv, re
 
-MESSAGE_BODY = """안녕하세요.
+MESSAGE_SUBJECT = "[개업소연 안내]"
+MESSAGE_CONTENT = """안녕하세요.
 국세청에서의 오랜 경험을 바탕으로 호연회계법인에서 새로운 출발을 하게 된 윤성중 세무사입니다.
 
 그동안 보내주신 관심에 감사드리며, 앞으로도 많은 응원과 격려 부탁드립니다.
 
-뜻깊은 시작을 기쁜 마음으로 함께해 주시면 감사하겠습니다."""
+뜻깊은 시작을 기쁜 마음으로 함께해 주시면 감사하겠습니다.
+
+아래 링크를 클릭하여 내용을 확인해주세요.
+
+https://sngwwvvvv.github.io/invitation-design-ysj/"""
+MESSAGE_BODY = f"{MESSAGE_SUBJECT}\n\n{MESSAGE_CONTENT}"
 
 
 @dataclass(frozen=True)
@@ -86,37 +92,23 @@ def _jpeg_size(data):
 
 def validate_images(directory):
     infos = []
-    for name in ("mms_01_intro.jpg", "mms_02_details.jpg"):
-        p = Path(directory) / name
-        if not p.exists():
-            raise ValueError(f"missing image: {name}")
-        data = p.read_bytes()
-        w, h = _jpeg_size(data)
-        if len(data) > 300 * 1024 or w > 1500 or h > 1440:
-            raise ValueError(f"image limits exceeded: {name}")
-        infos.append(ImageInfo(name, p, data, w, h))
+    name = "mms_01_intro.jpg"
+    p = Path(directory) / name
+    if not p.exists():
+        raise ValueError(f"missing image: {name}")
+    data = p.read_bytes()
+    w, h = _jpeg_size(data)
+    if len(data) > 300 * 1024 or w > 1500 or h > 1440:
+        raise ValueError(f"image limits exceeded: {name}")
+    infos.append(ImageInfo(name, p, data, w, h))
     extras = [
-        p
-        for p in Path(directory).iterdir()
-        if p.is_file()
-        and p.suffix.lower() in (".jpg", ".jpeg")
-        and p.name not in ("mms_01_intro.jpg", "mms_02_details.jpg")
+        file
+        for file in Path(directory).iterdir()
+        if file.is_file()
+        and file.suffix.lower() in (".jpg", ".jpeg")
+        and file.name != name
     ]
     if extras:
-        raise ValueError("exactly two JPEG images required")
+        raise ValueError("exactly one JPEG image required")
     return tuple(infos)
-
-
-def split_message_body(body: str) -> tuple[str, str]:
-    lines = body.splitlines()
-    if lines and lines[0].startswith("[") and lines[0].endswith("]"):
-        title = lines[0]
-        idx = 1
-        while idx < len(lines) and not lines[idx].strip():
-            idx += 1
-        rest = "\n".join(lines[idx:])
-        if body.endswith("\n") and rest and not rest.endswith("\n"):
-            rest += "\n"
-        return title, rest
-    return " ", body
 

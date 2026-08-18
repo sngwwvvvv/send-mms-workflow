@@ -12,7 +12,7 @@ from urllib.error import HTTPError
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
-from .inputs import MESSAGE_BODY
+from .inputs import MESSAGE_BODY, MESSAGE_CONTENT, MESSAGE_SUBJECT
 
 
 @dataclass(frozen=True)
@@ -321,23 +321,16 @@ class SensClient:
         file_ids: Sequence[str],
         *,
         content_type: str,
-        content: str = " ",
-        subject: str | None = None,
+        content: str = MESSAGE_CONTENT,
+        subject: str | None = MESSAGE_SUBJECT,
     ) -> SendResponse:
-        if type(content_type) is not str or content_type not in {"COMM", "AD"}:
-            raise ExplicitApiFailure("INVALID_REQUEST", "content type is invalid")
-        payload = {
-            "type": "MMS",
-            "contentType": content_type,
-            "countryCode": "82",
-            "from": self._from_number,
-            "content": content,
-            "messages": [{"to": to}],
-            "files": [{"fileId": file_id} for file_id in file_ids],
-        }
-        if subject is not None:
-            payload["subject"] = subject
-        return self._send_message(payload)
+        return self.send_one(
+            to,
+            file_ids,
+            content_type=content_type,
+            content=content,
+            subject=subject,
+        )
 
     def send_lms(
         self,
@@ -367,7 +360,8 @@ class SensClient:
         file_ids: Sequence[str],
         *,
         content_type: str,
-        subject: str | None = None,
+        content: str = MESSAGE_CONTENT,
+        subject: str | None = MESSAGE_SUBJECT,
     ) -> SendResponse:
         if type(content_type) is not str or content_type not in {"COMM", "AD"}:
             raise ExplicitApiFailure("INVALID_REQUEST", "content type is invalid")
@@ -376,7 +370,7 @@ class SensClient:
             "contentType": content_type,
             "countryCode": "82",
             "from": self._from_number,
-            "content": MESSAGE_BODY,
+            "content": content,
             "messages": [{"to": to}],
             "files": [{"fileId": file_id} for file_id in file_ids],
         }

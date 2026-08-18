@@ -22,7 +22,7 @@ from .event_log import (
 )
 from .preflight import ApprovedWork
 from .results import ResultFormatError, ResultRow
-from .inputs import MESSAGE_BODY
+from .inputs import MESSAGE_BODY, MESSAGE_CONTENT, MESSAGE_SUBJECT
 
 
 SEOUL = ZoneInfo("Asia/Seoul")
@@ -61,15 +61,12 @@ class RecipientPipeline:
         api: SensClient,
         coordinator: RunCoordinator,
         content_type: str,
-        *,
-        split: bool = False,
     ):
         if type(content_type) is not str or content_type not in {"COMM", "AD"}:
             raise ResultFormatError("approved content type invalid")
         self.api = api
         self.coordinator = coordinator
         self.content_type = content_type
-        self.split = split
 
     def run(
         self,
@@ -84,79 +81,14 @@ class RecipientPipeline:
             raise ResultFormatError("approved work action invalid")
         if action == "HOLD_AMBIGUOUS":
             return PipelineResult(row)
-
-        if not self.split:
-            if action == "RECONCILE":
-                if not self._is_legal_reconciliation(row):
-                    return PipelineResult(row)
-                return self._reconcile_single(row, work)
-            if not self._is_legal_send(row, work):
-                return PipelineResult(row)
-            return self._send_single(row, work, tuple(file_ids))
-
         if action == "RECONCILE":
             if not self._is_legal_reconciliation(row):
                 return PipelineResult(row)
-            reconcile_result = self._reconcile(row, work)
-            if reconcile_result.stage_success:
-                if reconcile_result.row.delivery_status == "SENT":
-                    return reconcile_result
-                # MMS succeeded, proceed to LMS stage
-                lms_row = replace(reconcile_result.row, attempts=0, request_id="", message_id="")
-                lms_row = self._checkpoint(reconcile_result.row, lms_row)
-                return self._execute_stage(
-                    "LMS",
-                    lms_row,
-                    work,
-                    file_ids=(),
-                    content=_SPLIT_LMS_CONTENT,
-                )
-            return reconcile_result
+            return self._reconcile_single(row, work)
 
         if not self._is_legal_send(row, work):
             return PipelineResult(row)
-
-        if work.action == "RETRY_EXPLICIT":
-            try:
-                response = self.api.get_message(row.message_id)
-                stage = response.message.message_type
-            except TransientLookupError:
-                return PipelineResult(row)
-            if stage not in {"MMS", "LMS"}:
-                return PipelineResult(row)
-        else:
-            stage = "MMS"
-
-        if stage == "MMS":
-            mms_result = self._execute_stage(
-                "MMS",
-                row,
-                work,
-                tuple(file_ids),
-                content=_SPLIT_MMS_CONTENT,
-                retry_not_before=work.retry_not_before if work.action == "RETRY_EXPLICIT" else None,
-            )
-            if mms_result.stage_success:
-                # Reset attempts to 0 before starting LMS stage
-                lms_row = replace(mms_result.row, attempts=0, request_id="", message_id="")
-                lms_row = self._checkpoint(mms_result.row, lms_row)
-                return self._execute_stage(
-                    "LMS",
-                    lms_row,
-                    work,
-                    file_ids=(),
-                    content=_SPLIT_LMS_CONTENT,
-                )
-            return mms_result
-        else:
-            return self._execute_stage(
-                "LMS",
-                row,
-                work,
-                file_ids=(),
-                content=_SPLIT_LMS_CONTENT,
-                retry_not_before=work.retry_not_before,
-            )
+        return self._send_single(row, work, tuple(file_ids))
 
     @classmethod
     def _is_pending_base(cls, row: ResultRow) -> bool:
@@ -785,6 +717,8 @@ class RecipientPipeline:
                     current.receiving_number,
                     file_ids,
                     content_type=self.content_type,
+                    content=MESSAGE_CONTENT,
+                    subject=MESSAGE_SUBJECT,
                 )
             except ExplicitApiFailure as failure:
                 if failure.http_status == 429:
