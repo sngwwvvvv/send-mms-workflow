@@ -52,7 +52,14 @@ import sys
 from typing import Literal
 
 def _mask(number: str) -> str:
-    return f"010-****-{number[-4:]}" if len(number) >= 4 else number
+    return f"****{number[-4:]}" if len(number) >= 4 else number
+
+
+def _log_single_line(receiving_number: str, progress: str, status: str) -> None:
+    sys.stderr.write(
+        f"[MMS 단건] {_mask(receiving_number)} | 진행상황: {progress} | 상태: {status}\n"
+    )
+    sys.stderr.flush()
 
 
 class RecipientPipeline:
@@ -709,6 +716,11 @@ class RecipientPipeline:
                 delivery_id=current.delivery_id,
                 attempt=current.attempts,
             )
+            _log_single_line(
+                current.receiving_number,
+                "전송 요청",
+                f"{current.attempts}/3",
+            )
             self.coordinator.before_api_call()
             started_at = self._seoul_time(self.coordinator.clock.now())
             attempt_started = self.coordinator.clock.monotonic()
@@ -768,6 +780,11 @@ class RecipientPipeline:
                 http_status=response.http_status,
                 request_id=current.request_id,
                 response=send_to_log_dict(response),
+            )
+            _log_single_line(
+                current.receiving_number,
+                "접수 확인",
+                response.status_code,
             )
             outcome = self._resolve_request_single(current, work, deadline)
             if not outcome.needs_post:
@@ -840,6 +857,7 @@ class RecipientPipeline:
         while not self._nonempty_exact_string(current.message_id):
             if not self._before_lookup(deadline):
                 return PipelineResult(current)
+            _log_single_line(current.receiving_number, "접수 확인", "조회 중")
             try:
                 response = self.api.list_by_request(current.request_id)
             except TransientLookupError as failure:
@@ -874,6 +892,7 @@ class RecipientPipeline:
         while self.coordinator.clock.monotonic() < deadline:
             if not self._before_lookup(deadline):
                 return PipelineResult(current)
+            _log_single_line(current.receiving_number, "최종 확인", "조회 중")
             try:
                 response = self.api.get_message(current.message_id)
             except TransientLookupError as failure:
@@ -924,6 +943,13 @@ class RecipientPipeline:
                 message_id=current.message_id,
                 response=message_result_to_log_dict(response),
             )
+            if correlated and type(message.status) is str:
+                if message.status in {"READY", "PROCESSING"}:
+                    _log_single_line(
+                        current.receiving_number,
+                        "최종 확인",
+                        message.status,
+                    )
             if outcome is not None:
                 return outcome
             if not self._sleep_for_poll(deadline):
@@ -937,6 +963,7 @@ class RecipientPipeline:
             is_sent="true",
             error=None,
         )
+        _log_single_line(row.receiving_number, "완료", "SENT")
         return PipelineResult(self._checkpoint(row, sent))
 
     def _explicit_failure_single(
@@ -953,6 +980,7 @@ class RecipientPipeline:
                 is_sent="false",
                 error=safe_error_dict(status, message),
             )
+            _log_single_line(row.receiving_number, "완료", "FAILED")
             return PipelineResult(self._checkpoint(row, failed))
         if not work.allow_retry_after_explicit_failure:
             return PipelineResult(row)
@@ -973,6 +1001,7 @@ class RecipientPipeline:
     ) -> None:
         if failure.http_status == 429:
             self.coordinator.record_429()
+        _log_single_line(row.receiving_number, "조회 중", "실패")
         self.coordinator.write(
             "API_LOOKUP_ERROR",
             delivery_id=row.delivery_id,
@@ -988,6 +1017,7 @@ class RecipientPipeline:
         )
 
     def _log_retry_single(self, row: ResultRow) -> None:
+        _log_single_line(row.receiving_number, "재시도 대기", f"{row.attempts + 1}/3")
         self.coordinator.write(
             "RETRY_SCHEDULED",
             delivery_id=row.delivery_id,
@@ -995,6 +1025,7 @@ class RecipientPipeline:
         )
 
     def _log_ambiguous_single(self, row: ResultRow) -> None:
+        _log_single_line(row.receiving_number, "접수 확인 불가", "미확정")
         self.coordinator.write(
             "SEND_AMBIGUOUS_OUTCOME",
             delivery_id=row.delivery_id,
@@ -1007,6 +1038,7 @@ class RecipientPipeline:
         )
 
     def _log_list_response_single(self, row, response) -> None:
+        _log_single_line(row.receiving_number, "접수 확인", "조회 중")
         self.coordinator.write(
             "MESSAGE_LIST_RESPONSE",
             delivery_id=row.delivery_id,

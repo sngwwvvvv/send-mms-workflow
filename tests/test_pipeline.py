@@ -2,8 +2,10 @@
 
 from dataclasses import replace
 from datetime import datetime
+from contextlib import redirect_stderr
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from io import StringIO
 import threading
 import unittest
 
@@ -337,6 +339,25 @@ class PipelineTests(unittest.TestCase):
             ],
         )
         self.assertEqual(self.persisted(), result.row)
+
+    def test_single_send_logs_masked_number_and_progress(self):
+        api = ScriptedPipelineApi(
+            sends=(send_response(),),
+            lists=(list_response(message("COMPLETED", "success")),),
+            gets=(result_response(message("COMPLETED", "success")),),
+        )
+        pipeline, _, _, _ = self.make_pipeline(api, reservation())
+        stderr = StringIO()
+
+        with redirect_stderr(stderr):
+            result = pipeline.run(reservation(), work(), ("file-1", "file-2"))
+
+        output = stderr.getvalue()
+        self.assertEqual(result.row.delivery_status, "SENT")
+        self.assertIn("****0001", output)
+        self.assertIn("진행상황: 전송 요청", output)
+        self.assertIn("진행상황: 접수 확인", output)
+        self.assertIn("상태: SENT", output)
 
     def test_attempt_state_event_failure_leaves_ambiguous_row_and_starts_no_post(self):
         """Catches POST beginning after the attempt checkpoint cannot be logged."""
