@@ -1,19 +1,7 @@
 from dataclasses import dataclass
 from pathlib import Path
 import csv, re
-
-MESSAGE_SUBJECT = "[개업소연 안내]"
-MESSAGE_CONTENT = """안녕하세요.
-국세청에서의 오랜 경험을 바탕으로 호연회계법인에서 새로운 출발을 하게 된 윤성중 세무사입니다.
-
-그동안 보내주신 관심에 감사드리며, 앞으로도 많은 응원과 격려 부탁드립니다.
-
-뜻깊은 시작을 기쁜 마음으로 함께해 주시면 감사하겠습니다.
-
-아래 링크를 클릭하여 내용을 확인해주세요.
-
-https://sngwwvvvv.github.io/invitation-design-ysj/"""
-MESSAGE_BODY = f"{MESSAGE_SUBJECT}\n\n{MESSAGE_CONTENT}"
+import unicodedata
 
 
 @dataclass(frozen=True)
@@ -90,25 +78,98 @@ def _jpeg_size(data):
     raise ValueError("JPEG dimensions unavailable")
 
 
+class TemplateError(ValueError):
+    """A fixed, safe local template validation error."""
+
+
+@dataclass(frozen=True)
+class LoadedTemplate:
+    name: str
+    message_bytes: bytes
+    content: str
+    images: tuple[ImageInfo, ...]
+
+
+def _safe_child(parent, name):
+    if (
+        type(name) is not str or not name or name in {".", ".."}
+        or any(c in name for c in '/\\:')
+        or name.endswith((".", " "))
+        or any(unicodedata.category(c).startswith("C") for c in name)
+    ):
+        raise TemplateError("template and file names must be safe direct names")
+    path = parent / name
+    if (
+        path.is_symlink() or path.is_junction()
+        or path.resolve().parent != parent.resolve()
+    ):
+        raise TemplateError("template folders and files must stay inside input")
+    return path
+
+
+def _input_directory(root):
+    directory = _safe_child(Path(root).resolve(), "input")
+    if not directory.is_dir():
+        raise TemplateError("create input/NAME with message.txt and one or two JPEGs")
+    return directory
+
+
+def list_templates(root):
+    directory = _input_directory(root)
+    templates = []
+    for entry in sorted(directory.iterdir(), key=lambda path: path.name):
+        entry = _safe_child(directory, entry.name)
+        if entry.is_dir():
+            files = [_safe_child(entry, file.name) for file in entry.iterdir()]
+            count = sum(
+                file.is_file() and file.suffix.lower() in {".jpg", ".jpeg"}
+                for file in files
+            )
+            templates.append((entry.name, count))
+    if not templates:
+        raise TemplateError("create input/NAME with message.txt and one or two JPEGs")
+    return tuple(templates)
+
+
 def validate_images(directory):
-    infos = []
-    name = "mms_01_intro.jpg"
-    p = Path(directory) / name
-    if not p.exists():
-        raise ValueError(f"missing image: {name}")
-    data = p.read_bytes()
-    w, h = _jpeg_size(data)
-    if len(data) > 300 * 1024 or w > 1500 or h > 1440:
-        raise ValueError(f"image limits exceeded: {name}")
-    infos.append(ImageInfo(name, p, data, w, h))
-    extras = [
-        file
-        for file in Path(directory).iterdir()
-        if file.is_file()
-        and file.suffix.lower() in (".jpg", ".jpeg")
-        and file.name != name
+    directory = Path(directory)
+    files = [
+        _safe_child(directory, file.name)
+        for file in sorted(directory.iterdir(), key=lambda path: path.name)
     ]
-    if extras:
-        raise ValueError("exactly one JPEG image required")
+    files = [file for file in files if file.suffix.lower() in {".jpg", ".jpeg"}]
+    if not 1 <= len(files) <= 2:
+        raise TemplateError("template requires one or two JPEG images")
+    infos = []
+    for path in files:
+        if not path.is_file():
+            raise TemplateError("template JPEG must be a regular file")
+        data = path.read_bytes()
+        try:
+            w, h = _jpeg_size(data)
+        except ValueError:
+            raise TemplateError("template image must be a readable JPEG") from None
+        if len(data) > 300 * 1024 or not 0 < w <= 1500 or not 0 < h <= 1440:
+            raise TemplateError("JPEG limits are 300 KB and 1500 x 1440 positive pixels")
+        infos.append(ImageInfo(path.name, path, data, w, h))
     return tuple(infos)
 
+
+def load_template(root, template_name):
+    directory = _safe_child(_input_directory(root), template_name)
+    if not directory.is_dir():
+        raise TemplateError("selected template folder does not exist")
+    message = _safe_child(directory, "message.txt")
+    if not message.is_file():
+        raise TemplateError("selected template requires UTF-8 message.txt")
+    raw = message.read_bytes()
+    try:
+        content = raw.decode("utf-8-sig")
+        encoded = content.encode("euc-kr")
+    except UnicodeError:
+        raise TemplateError("message.txt must be UTF-8 text supported by EUC-KR") from None
+    if not content.strip():
+        raise TemplateError("message.txt must not be blank")
+    if len(encoded) > 2000:
+        raise TemplateError("MMS content must not exceed 2000 EUC-KR bytes")
+    return LoadedTemplate(template_name, raw, content, validate_images(directory))

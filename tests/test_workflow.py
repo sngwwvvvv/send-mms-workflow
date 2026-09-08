@@ -1,7 +1,8 @@
-﻿import csv
+import csv
 from dataclasses import replace
 from datetime import datetime, timedelta
 import io
+import hashlib
 import json
 import tempfile
 import threading
@@ -25,7 +26,7 @@ from sens_mms.api import (
 from sens_mms.config import Config
 from sens_mms.coordination import RUN_SETTINGS, RunCoordinator
 from sens_mms.event_log import EventLogError, JsonlEventLog
-from sens_mms.inputs import MESSAGE_BODY
+from tests.test_inputs import TEST_BODY
 from sens_mms.preflight import canonical_result_state
 from sens_mms.results import ResultFormatError, ResultRow, ResultStore
 from sens_mms.workflow import Workflow
@@ -57,8 +58,9 @@ def make_root(numbers=(RECIPIENT,)):
     (root / "receiving_numbers.csv").write_text(
         "number\n" + "\n".join(numbers) + "\n", encoding="utf-8"
     )
-    image_dir = root / "mms_img"
-    image_dir.mkdir()
+    image_dir = root / "input" / "notice"
+    image_dir.mkdir(parents=True)
+    (image_dir / "message.txt").write_bytes(TEST_BODY.encode("utf-8"))
     (image_dir / "mms_01_intro.jpg").write_bytes(tiny_jpeg())
     return root
 
@@ -782,7 +784,7 @@ def make_workflow(
         event_log or RecordingEventLog(root),
         delivery_id_factory
         or FixedIdFactory(DELIVERY_ID_1, DELIVERY_ID_2, DELIVERY_ID_3),
-        resend_failed=resend_failed,
+        resend_failed=resend_failed, template_name="notice",
     )
 
 
@@ -814,7 +816,7 @@ class WorkflowTests(unittest.TestCase):
         forbidden = (
             RECIPIENT,
             SENDER,
-            MESSAGE_BODY,
+            TEST_BODY,
             "file-1",
             "file-2",
             FAKE_ACCESS_KEY,
@@ -867,7 +869,7 @@ class WorkflowTests(unittest.TestCase):
             OrchestrationApi(),
             ThreadSafeClock(),
             RecordingEventLog(root),
-            FixedIdFactory(),
+            FixedIdFactory(), template_name="notice",
         )
         interruption = KeyboardInterrupt("submission interrupted")
         executors = []
@@ -919,7 +921,7 @@ class WorkflowTests(unittest.TestCase):
             OrchestrationApi(),
             ThreadSafeClock(),
             RecordingEventLog(root),
-            FixedIdFactory(),
+            FixedIdFactory(), template_name="notice",
         )
         interruption = KeyboardInterrupt("collection interrupted")
         executors = []
@@ -1292,7 +1294,7 @@ class WorkflowTests(unittest.TestCase):
             api,
             ThreadSafeClock(),
             RecordingEventLog(root),
-            FixedIdFactory(),
+            FixedIdFactory(), template_name="notice",
         )
 
         summary = workflow.run_live(workflow.current_token())
@@ -1318,7 +1320,7 @@ class WorkflowTests(unittest.TestCase):
             FixedIdFactory(
                 "CCCCCCCCCCCCCCC4",
                 "CCCCCCCCCCCCCCC5",
-            ),
+            ), template_name="notice",
         )
 
         with self.assertRaises(EventLogError) as raised:
@@ -1535,7 +1537,7 @@ class WorkflowTests(unittest.TestCase):
                 api,
                 ThreadSafeClock(),
                 log,
-                FixedIdFactory(*ids),
+                FixedIdFactory(*ids), template_name="notice",
             )
 
         with self.assertRaisesRegex(OSError, "checkpoint unavailable"):
@@ -1567,7 +1569,7 @@ class WorkflowTests(unittest.TestCase):
                 api,
                 ThreadSafeClock(),
                 log,
-                FixedIdFactory(*ids),
+                FixedIdFactory(*ids), template_name="notice",
             )
 
         with self.assertRaises(EventLogError) as raised:
@@ -1649,7 +1651,7 @@ class WorkflowTests(unittest.TestCase):
 
     def test_upload_uses_immutable_bytes_approved_by_final_preflight(self):
         root = make_root()
-        image_path = root / "mms_img" / "mms_01_intro.jpg"
+        image_path = root / "input" / "notice" / "mms_01_intro.jpg"
         approved = image_path.read_bytes()
         unapproved = b"UNAPPROVED_IMAGE_BYTES_01012345678"
         api = ByteCapturingApi(
@@ -1677,7 +1679,7 @@ class WorkflowTests(unittest.TestCase):
             workflow.run_live(token)
 
         self.assertEqual(calls, 2)
-        self.assertEqual(api.uploaded_bytes[0], ("mms_01_intro.jpg", approved))
+        self.assertEqual(api.uploaded_bytes[0], (hashlib.sha256(approved).hexdigest()[:36] + ".jpg", approved))
         self.assertNotEqual(api.uploaded_bytes[0][1], unapproved)
 
     def test_real_api_malformed_ids_remain_pending_without_retry_or_durable_marker(self):
@@ -2017,7 +2019,8 @@ class WorkflowTests(unittest.TestCase):
         root = make_root()
         observed_modes = []
 
-        def recording_preflight(root_arg, config_arg, store_arg, *, resend_failed):
+        def recording_preflight(root_arg, config_arg, store_arg, *, template_name, resend_failed):
+            self.assertEqual(template_name, "notice")
             self.assertEqual(root_arg, root)
             self.assertIs(store_arg, store)
             observed_modes.append(resend_failed)
@@ -2027,6 +2030,7 @@ class WorkflowTests(unittest.TestCase):
                 eligible_rows=(),
                 work_items=(),
                 content_type="COMM",
+                content=TEST_BODY,
                 approved_images=(),
                 approved_result_state=canonical_result_state(()),
             )
@@ -2327,7 +2331,7 @@ class WorkflowTests(unittest.TestCase):
                 self.assertEqual(store.path.read_bytes(), mutation_payload[0])
                 self.assertEqual(
                     (api.uploaded, api.sent, api.listed_requests, api.time_listed, api.got),
-                    (["mms_01_intro.jpg"], [], [], [], []),
+                    ([hashlib.sha256(tiny_jpeg()).hexdigest()[:36] + ".jpg"], [], [], [], []),
                 )
                 self.assertEqual(
                     [event for event, _ in log.events],
@@ -2702,7 +2706,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual((summary.sent, summary.failed, summary.pending), (1, 0, 0))
         self.assertEqual((row.delivery_status, row.is_sent, row.attempts), ("SENT", "true", 1))
         self.assertEqual((row.request_id, row.message_id, row.error), ("request-1", "message-1", None))
-        self.assertEqual(api.uploaded, ["mms_01_intro.jpg"])
+        self.assertEqual(api.uploaded, [hashlib.sha256(tiny_jpeg()).hexdigest()[:36] + ".jpg"])
         self.assertEqual(api.sent, [(RECIPIENT, ("file-1",))])
         self.assertIn(RUN_SETTINGS.poll_interval_seconds, clock.sleeps)
 
@@ -2892,7 +2896,7 @@ class WorkflowTests(unittest.TestCase):
         )
         self.assertEqual(
             [name for name, _data in api.uploaded],
-            ["mms_01_intro.jpg"],
+            [hashlib.sha256(tiny_jpeg()).hexdigest()[:36] + ".jpg"],
         )
         self.assertEqual(
             {(number, files) for number, files, _content_type in api.sent},
@@ -3834,7 +3838,7 @@ class WorkflowTests(unittest.TestCase):
 
     def test_invalid_image_blocks_before_any_api_call(self):
         root = make_root()
-        (root / "mms_img" / "mms_02_details.jpg").write_bytes(b"not-a-jpeg")
+        (root / "input" / "notice" / "mms_02_details.jpg").write_bytes(b"not-a-jpeg")
         api = ScriptedApi(sends=[], lists=[], gets=[])
         workflow = make_workflow(root, ResultStore.for_root(root), api)
 

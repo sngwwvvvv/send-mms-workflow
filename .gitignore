@@ -7,9 +7,14 @@
 result.csv
 result.*.csv
 receiving_numbers.csv
+receiving_numbers_*.csv
+receipt_numbers.xlsx
+~$*.xlsx
 results/
 logs/
 mms_img/
+input/*
+!input/README.md
 .superpowers/
 .worktrees/
 *.jsonl

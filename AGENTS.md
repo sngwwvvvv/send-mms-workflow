@@ -35,6 +35,7 @@ max_in_flight=8
 - A cooperating live Workflow must hold the project live-execution lock for the entire live run before writing `WORKFLOW_STARTED` or making any API call. The lock combines a canonical-path process-local nonblocking lock with a Windows/POSIX OS file lock and fails closed with a fixed safe error.
 - A logging or checkpoint failure stops all later new POSTs and never causes an uncertain resend.
 - Final image preflight reads each required JPEG once and retains those immutable bytes internally. Metadata, SHA-256, approval token, and Base64 upload must all derive from that same byte copy; Workflow must not reopen an image path after final token validation.
+- Final template preflight also retains the exact original UTF-8 message bytes, including an optional UTF-8 BOM. The token binds those original bytes; decoded send content excludes the BOM file marker. The token also binds the template name, image names/order/bytes, recipients and existing approval state. Send content comes from that same final report; no hardcoded message fallback or post-validation text reload is allowed.
 - Do not automatically delete results, snapshots, or event logs.
 
 ## 적용 범위와 우선순위
@@ -85,37 +86,38 @@ attempts=0
 error={"status":"VALIDATION_ERROR","message":"수신번호 검증 실패 사유"}
 ```
 
+### 템플릿 선택
+
+- 프로젝트 루트의 `input/<템플릿명>/` 폴더 하나가 템플릿 하나다. 각 폴더에 UTF-8 `message.txt`와 JPG/JPEG 이미지 1~2장을 준비한다. 1~2장은 현재 프로젝트의 지원 범위이며 SENS 최대 첨부 수를 뜻하지 않는다.
+- `preflight`는 이름순 템플릿 목록과 이미지 수를 터미널에 표시하고 번호 입력으로 선택한다. `--template <템플릿명>`을 지정하면 입력 없이 해당 템플릿을 검증한다.
+- 비대화형 실행과 `live`에는 `--template`이 필수다. 템플릿이 하나여도 자동 선택하지 않으며 `live`는 선택을 묻지 않는다.
+- 템플릿 선택은 실발송 승인이 아니다. 선택한 이름, 본문 전체, 첨부 순서 및 검증 결과를 표시한 후 해당 실행에 대한 새 승인을 받아야 한다.
+- `input` 밖 경로, 경로 순회, 절대 경로, 심볼릭 링크·정션을 통한 경로 이탈은 허용하지 않는다. 표시되는 폴더·파일 이름에 제어 문자를 허용하지 않는다.
+- 템플릿 파일은 개인 입력 자료로 Git에서 제외한다. 런타임은 기존 `mms_img`나 소스 코드 문구로 자동 대체하지 않는다.
+
 ### MMS 이미지
 
-- 이미지 경로는 프로젝트 루트의 `mms_img`다.
-- JPG 또는 JPEG 파일이 정확히 두 개 있어야 한다.
+- 이미지 경로는 선택한 `input/<템플릿명>/` 폴더다.
+- JPG 또는 JPEG 파일이 1~2개 있어야 한다.
 - 각 파일은 300KB 이하, 해상도 1500×1440 이하여야 한다.
-- 현재 첨부 순서는 `mms_01_intro.jpg`, `mms_02_details.jpg`다.
-- 이미지는 승인된 발송 실행당 한 번씩 업로드하고 반환된 두 `fileId`를 같은 실행의 모든 단건 요청에 재사용한다.
+- 첨부 순서는 파일명 순서이며 `01_intro.jpg`, `02_details.jpg`처럼 번호 접두어를 권장한다.
+- 이미지는 승인된 발송 실행당 한 번씩 업로드하고 반환된 `fileId`를 같은 실행의 모든 단건 요청에 재사용한다.
+- API 업로드 파일명은 승인된 이미지 바이트의 SHA-256에서 파생한 40자 이하 ASCII 이름을 사용한다. SENS의 같은 이름·크기 파일 재사용으로 다른 템플릿 이미지가 혼동되지 않도록 한다. 사전 검증에는 원래 로컬 파일명을 표시한다.
 - SENS 요청의 `files` 배열에서도 위 순서를 유지한다.
 - 워크플로우가 보장할 수 있는 것은 첨부 순서뿐이다. 두 이미지의 좌우 배치는 수신 단말과 메시지 앱이 결정하므로 SENS API로 보장하지 않는다.
 
 ### 발송 본문
 
-아래 본문을 줄바꿈까지 정확히 유지한다.
-
-```text
-[개업소연 안내]
-
-안녕하세요.
-국세청에서의 오랜 경험을 바탕으로 호연회계법인에서 새로운 출발을 하게 된 윤성중 세무사입니다.
-
-그동안 보내주신 관심과 성원에 감사드리며, 앞으로도 많은 관심과 응원 부탁드립니다.
-
-새로운 시작을 기쁜 마음으로 함께해 주시면 감사하겠습니다.
-```
+선택한 템플릿의 `message.txt` 전체가 발송 본문이다. 코드에 특정 행사 문구를 하드코딩하지 않는다.
 
 - 메시지 `type`은 `MMS`다.
 - 별도 `subject`는 넣지 않는다.
-- 본문을 임의로 수정하거나 문구를 자동 삽입하지 않는다. 단, 2단계 분리 발송의 1단계 MMS 이미지 전송 시에는 필수 파라미터 제약 해결 및 통신사 3009 에러 예방을 위해 content 필드를 메시지 본문의 첫 줄 제목(예: "[개업소연 안내]")으로 설정한다.
-- 워크플로우 구현 또는 수정은 `MESSAGE_BODY`가 승인된 UTF-8 본문과 바이트 단위로 일치함을 정확한 동등성 자동 테스트가 확인한 경우에만 진행할 수 있다.
+- 제목 줄을 포함하여 본문 전체의 공백과 줄바꿈을 유지한다. 선택적 UTF-8 BOM만 파일 표식으로 제거하며 본문을 분리하거나 문구를 자동 삽입하지 않는다.
+- 공백뿐인 본문, UTF-8이 아닌 파일, EUC-KR로 표현할 수 없는 문자, EUC-KR 기준 2000바이트 초과 본문은 발송 전에 차단한다. 길이에 맞춰 자르거나 문자를 대체하지 않는다.
+- 선택한 파일의 본문이 사전 검증 출력 및 실제 요청 content와 정확히 일치하고, 본문·이미지·템플릿 변경 시 이전 승인 토큰이 거부됨을 자동 테스트로 확인한다.
 - `contentType`의 광고성 여부가 확정되지 않았다면 실발송 전에 중단하고 사용자에게 확인한다.
 - 광고성 메시지로 분류된다면 관련 법령과 SENS 정책을 확인하고, 필요한 표시를 갖춘 별도 승인 문안 없이는 발송하지 않는다.
+- 현재 런타임은 `COMM`만 지원한다. 템플릿 선택 기능은 광고 발송 지원이나 광고성 판단을 추가하지 않는다.
 
 ## 인증과 요청 서명
 
@@ -132,8 +134,8 @@ error={"status":"VALIDATION_ERROR","message":"수신번호 검증 실패 사유"
 2. 인증 정보가 존재하지만 출력이나 로그에 노출되지 않는다.
 3. 발신번호가 SENS에 등록된 번호다.
 4. 수신번호 파일, 필수 열, 정규화, 검증, 중복 제거가 완료됐다.
-5. 이미지가 정확히 두 개이며 형식, 크기, 해상도 제한을 만족한다.
-6. 본문이 승인된 내용과 정확히 일치한다.
+5. 선택한 템플릿에 이미지가 1~2개이며 형식, 크기, 해상도 제한을 만족한다.
+6. 본문이 선택한 `message.txt` 및 승인된 내용과 정확히 일치하고 인코딩·길이 검증을 통과한다.
 7. `contentType`이 사용자에게 확인됐다.
 8. 기존 `results/result.csv`의 `SENT`, `FAILED`, `PENDING_CONFIRMATION` 상태를 조정했다.
 
@@ -144,7 +146,7 @@ error={"status":"VALIDATION_ERROR","message":"수신번호 검증 실패 사유"
 - SENS가 한 요청에 여러 수신번호를 허용하더라도 배치 발송하지 않는다.
 - 수신번호별로 독립된 POST 요청을 만든다.
 - 각 요청의 `messages` 배열에는 `to` 한 건만 넣는다.
-- 각 요청은 `type="MMS"`, 사전 승인된 `contentType`, `countryCode="82"`, 메시지 본문의 첫 줄 제목(예: "[개업소연 안내]")의 content, subject 없음, `messages=[{"to": "<한 수신번호>"}]`, `files=[{"fileId": intro}, {"fileId": details}]` 순서를 사용한다. 단, 2단계 분리 발송의 2단계 LMS 발송 시에는 승인된 `MESSAGE_BODY`에서 첫 줄 제목과 그 뒤의 빈 줄들을 제외한 나머지 본문 내용을 content로 사용한다.
+- 각 요청은 `type="MMS"`, 사전 승인된 `contentType`, `countryCode="82"`, 선택·승인된 `message.txt` 전체의 content, subject 없음, `messages=[{"to": "<한 수신번호>"}]`, 승인된 파일명 순서의 `files=[{"fileId": ...}, ...]`를 사용한다. 제목·본문·이미지를 하나의 MMS로 보낸다.
 - POST API 호출 한 번을 발송 시도 한 번으로 계산한다.
 - POST 응답의 `statusCode="202"`는 요청 접수 성공일 뿐 최종 전송 성공이 아니다.
 - `202` 응답의 `requestId`를 즉시 결과 상태에 저장한다.
@@ -210,6 +212,8 @@ receiving_number,delivery_id,delivery_status,is_sent,attempts,request_id,message
 ## 재실행과 별도 재발송
 
 모든 재실행은 신규 발송보다 기존 상태 조정을 먼저 수행한다.
+
+템플릿별 결과 파일이나 별도 캠페인은 만들지 않는다. 모든 템플릿은 기존 `results/result.csv`를 공유하며 템플릿 변경만으로 `SENT`·`PENDING_CONFIRMATION` 상태를 초기화하지 않는다. 사전 검증에서 재시도 대상으로 제시된 요청이 명시적 실패로 확인되고 재POST가 승인된 경우에는 이번에 선택·승인한 템플릿으로 재시도한다. 미확정 요청을 다른 템플릿이라는 이유로 재발송하지 않는다.
 
 1. 기존 `results/result.csv`를 읽는다.
 2. 모든 `PENDING_CONFIRMATION` 요청을 저장된 식별자로 다시 조회한다.

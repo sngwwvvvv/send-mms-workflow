@@ -1,4 +1,4 @@
-﻿import base64
+import base64
 import csv
 import hashlib
 import json
@@ -11,7 +11,8 @@ from unittest.mock import patch
 
 from sens_mms.config import Config
 from sens_mms.coordination import RUN_SETTINGS
-from sens_mms.inputs import ImageInfo, MESSAGE_BODY, MESSAGE_CONTENT, MESSAGE_SUBJECT
+from sens_mms.inputs import ImageInfo
+from tests.test_inputs import TEST_BODY, TEST_SUBJECT
 from sens_mms.preflight import ApprovedWork, PreflightReport, build_preflight
 from sens_mms.results import (
     ResultFormatError,
@@ -25,18 +26,9 @@ FIRST = "01011111111"
 SECOND = "01022222222"
 THIRD = "01033333333"
 VALID_DELIVERY_ID = "23456789ABCDEFGH"
-EXPECTED_SUBJECT = "[개업소연 안내]"
-EXPECTED_CONTENT = """안녕하세요.
-국세청에서의 오랜 경험을 바탕으로 호연회계법인에서 새로운 출발을 하게 된 윤성중 세무사입니다.
-
-그동안 보내주신 관심에 감사드리며, 앞으로도 많은 응원과 격려 부탁드립니다.
-
-뜻깊은 시작을 기쁜 마음으로 함께해 주시면 감사하겠습니다.
-
-아래 링크를 클릭하여 내용을 확인해주세요.
-
-https://sngwwvvvv.github.io/invitation-design-ysj/"""
-EXPECTED_BODY = f"{EXPECTED_SUBJECT}\n\n{EXPECTED_CONTENT}"
+EXPECTED_SUBJECT = TEST_SUBJECT
+EXPECTED_CONTENT = TEST_BODY
+EXPECTED_BODY = TEST_BODY
 
 
 def jpeg(comment_byte=b"A"):
@@ -52,8 +44,9 @@ def root_with_inputs(numbers=(FIRST,)):
     (root / "receiving_numbers.csv").write_text(
         "number\n" + "\n".join(numbers) + "\n", encoding="utf-8"
     )
-    images = root / "mms_img"
-    images.mkdir()
+    images = root / "input" / "notice"
+    images.mkdir(parents=True)
+    (images / "message.txt").write_bytes(TEST_BODY.encode("utf-8"))
     (images / "mms_01_intro.jpg").write_bytes(jpeg(b"A"))
     return root
 
@@ -193,7 +186,7 @@ class PreflightTests(unittest.TestCase):
             ),
         )
 
-        report = build_preflight(root, config(), ResultStore.for_root(root))
+        report = build_preflight(root, config(), ResultStore.for_root(root), template_name="notice")
 
         self.assertEqual(
             tuple(
@@ -237,7 +230,7 @@ class PreflightTests(unittest.TestCase):
             ),
         )
 
-        report = build_preflight(root, config(), ResultStore.for_root(root))
+        report = build_preflight(root, config(), ResultStore.for_root(root), template_name="notice")
         public = report.to_public_dict()
 
         self.assertEqual(
@@ -274,7 +267,7 @@ class PreflightTests(unittest.TestCase):
     def test_preflight_classifies_new_input_as_start_fresh_with_retry_allowed(self):
         root = root_with_inputs((FIRST,))
 
-        report = build_preflight(root, config(), ResultStore.for_root(root))
+        report = build_preflight(root, config(), ResultStore.for_root(root), template_name="notice")
 
         self.assertEqual(
             report.work_items,
@@ -294,7 +287,7 @@ class PreflightTests(unittest.TestCase):
             ),
         )
 
-        report = build_preflight(root, config(), store)
+        report = build_preflight(root, config(), store, template_name="notice")
 
         self.assertEqual(report.work_items, ())
         self.assertEqual(report.eligible_numbers, ())
@@ -314,7 +307,7 @@ class PreflightTests(unittest.TestCase):
             ),
         )
 
-        report = build_preflight(root, config(), ResultStore.for_root(root))
+        report = build_preflight(root, config(), ResultStore.for_root(root), template_name="notice")
 
         self.assertEqual(
             report.work_items,
@@ -338,7 +331,7 @@ class PreflightTests(unittest.TestCase):
             ResultFormatError,
             "^pending result row has message_id without request_id$",
         ):
-            build_preflight(root, config(), ResultStore.for_root(root))
+            build_preflight(root, config(), ResultStore.for_root(root), template_name="notice")
 
     def test_resend_preflight_classifies_snapshot_failed_rows_as_start_fresh(self):
         root = root_with_inputs((FIRST, SECOND))
@@ -359,7 +352,7 @@ class PreflightTests(unittest.TestCase):
             ),
         )
 
-        report = build_preflight(root, config(), current, resend_failed=True)
+        report = build_preflight(root, config(), current, resend_failed=True, template_name="notice")
 
         self.assertEqual(
             report.work_items,
@@ -381,10 +374,10 @@ class PreflightTests(unittest.TestCase):
             ),
         )
 
-        report = build_preflight(root, config(), ResultStore.for_root(root))
+        report = build_preflight(root, config(), ResultStore.for_root(root), template_name="notice")
         public = report.to_public_dict()
 
-        self.assertEqual(MESSAGE_BODY, EXPECTED_BODY)
+        self.assertEqual(public["body"].encode("utf-8"), (root / "input" / "notice" / "message.txt").read_bytes())
         self.assertEqual(public["body"], EXPECTED_BODY)
         self.assertEqual(public["subject"], EXPECTED_SUBJECT)
         self.assertEqual(public["content"], EXPECTED_CONTENT)
@@ -442,7 +435,7 @@ class PreflightTests(unittest.TestCase):
         )
 
         public = build_preflight(
-            root, config(), ResultStore.for_root(root)
+            root, config(), ResultStore.for_root(root), template_name="notice"
         ).to_public_dict()
         rendered = json.dumps(public, ensure_ascii=False)
 
@@ -464,11 +457,11 @@ class PreflightTests(unittest.TestCase):
 
     def test_public_report_has_exact_body_sender_and_only_masked_recipient(self):
         root = root_with_inputs()
-        report = build_preflight(root, config(), ResultStore.for_root(root))
+        report = build_preflight(root, config(), ResultStore.for_root(root), template_name="notice")
 
         public = report.to_public_dict()
 
-        self.assertEqual(MESSAGE_BODY, EXPECTED_BODY)
+        self.assertEqual(public["body"].encode("utf-8"), (root / "input" / "notice" / "message.txt").read_bytes())
         self.assertEqual(public["body"], EXPECTED_BODY)
         self.assertEqual(public["subject"], EXPECTED_SUBJECT)
         self.assertEqual(public["content"], EXPECTED_CONTENT)
@@ -482,23 +475,23 @@ class PreflightTests(unittest.TestCase):
     def test_token_changes_when_image_bytes_change_but_size_and_dimensions_do_not(self):
         root = root_with_inputs()
         store = ResultStore.for_root(root)
-        first = build_preflight(root, config(), store).approval_token
+        first = build_preflight(root, config(), store, template_name="notice").approval_token
 
-        (root / "mms_img" / "mms_01_intro.jpg").write_bytes(jpeg(b"Z"))
-        second = build_preflight(root, config(), store).approval_token
+        (root / "input" / "notice" / "mms_01_intro.jpg").write_bytes(jpeg(b"Z"))
+        second = build_preflight(root, config(), store, template_name="notice").approval_token
 
         self.assertNotEqual(first, second)
 
     def test_token_changes_when_work_item_action_retry_permission_or_source_delivery_id_changes(self):
         root = root_with_inputs((FIRST,))
         baseline_store = seed_current(root, (pending_with_ids(FIRST),))
-        first = build_preflight(root, config(), baseline_store).approval_token
+        first = build_preflight(root, config(), baseline_store, template_name="notice").approval_token
 
         hold_store = seed_current(root, (pending_blank_ids(FIRST),))
-        hold = build_preflight(root, config(), hold_store).approval_token
+        hold = build_preflight(root, config(), hold_store, template_name="notice").approval_token
 
         no_retry_store = seed_current(root, (pending_with_ids(FIRST, attempts=3),))
-        no_retry = build_preflight(root, config(), no_retry_store).approval_token
+        no_retry = build_preflight(root, config(), no_retry_store, template_name="notice").approval_token
 
         different_delivery_store = seed_current(
             root,
@@ -510,7 +503,7 @@ class PreflightTests(unittest.TestCase):
             ),
         )
         different_delivery = build_preflight(
-            root, config(), different_delivery_store
+            root, config(), different_delivery_store, template_name="notice"
         ).approval_token
 
         self.assertNotEqual(first, hold)
@@ -521,7 +514,7 @@ class PreflightTests(unittest.TestCase):
         """Catches a canonical token that omits any worker run setting."""
         root = root_with_inputs((FIRST,))
         store = ResultStore.for_root(root)
-        first = build_preflight(root, config(), store).approval_token
+        first = build_preflight(root, config(), store, template_name="notice").approval_token
         mutations = (
             {"worker_count": 6},
             {"poll_interval_seconds": 2},
@@ -539,7 +532,7 @@ class PreflightTests(unittest.TestCase):
                     "sens_mms.preflight.RUN_SETTINGS",
                     replace(RUN_SETTINGS, **mutation),
                 ):
-                    changed = build_preflight(root, config(), store).approval_token
+                    changed = build_preflight(root, config(), store, template_name="notice").approval_token
 
                 self.assertNotEqual(first, changed)
 
@@ -547,10 +540,10 @@ class PreflightTests(unittest.TestCase):
         """Catches a canonical token that omits the operator-approved body."""
         root = root_with_inputs((FIRST,))
         store = ResultStore.for_root(root)
-        first = build_preflight(root, config(), store).approval_token
+        first = build_preflight(root, config(), store, template_name="notice").approval_token
 
-        with patch("sens_mms.preflight.MESSAGE_BODY", "operator-approved body changed"):
-            changed_report = build_preflight(root, config(), store)
+        (root / "input" / "notice" / "message.txt").write_bytes(b"operator-approved body changed")
+        changed_report = build_preflight(root, config(), store, template_name="notice")
 
         self.assertEqual(changed_report.body, "operator-approved body changed")
         self.assertNotEqual(first, changed_report.approval_token)
@@ -559,7 +552,7 @@ class PreflightTests(unittest.TestCase):
         """Catches canonicalization that omits image name, size, dimensions, hash, or order."""
         root = root_with_inputs((FIRST,))
         store = ResultStore.for_root(root)
-        first = build_preflight(root, config(), store)
+        first = build_preflight(root, config(), store, template_name="notice")
         original_images = first.approved_images
         mutations = (
             ImageInfo(
@@ -582,36 +575,36 @@ class PreflightTests(unittest.TestCase):
         for mutated_first_image in mutations:
             with self.subTest(image=mutated_first_image):
                 with patch(
-                    "sens_mms.preflight.validate_images",
+                    "sens_mms.inputs.validate_images",
                     return_value=(mutated_first_image,),
                 ):
-                    changed = build_preflight(root, config(), store)
+                    changed = build_preflight(root, config(), store, template_name="notice")
 
                 self.assertNotEqual(first.approval_token, changed.approval_token)
 
     def test_token_changes_when_approved_content_type_changes(self):
         root = root_with_inputs((FIRST,))
         store = ResultStore.for_root(root)
-        first = build_preflight(root, config(), store).approval_token
+        first = build_preflight(root, config(), store, template_name="notice").approval_token
 
         with patch("sens_mms.preflight.APPROVED_CONTENT_TYPE", "AD"):
-            second = build_preflight(root, config(), store).approval_token
+            second = build_preflight(root, config(), store, template_name="notice").approval_token
 
         self.assertNotEqual(first, second)
 
     def test_build_preflight_reads_each_image_exactly_once(self):
         root = root_with_inputs()
-        image_dir = root / "mms_img"
+        image_dir = root / "input" / "notice"
         original_read_bytes = Path.read_bytes
         reads = []
 
         def recording_read_bytes(path):
-            if path.parent == image_dir:
+            if path.parent == image_dir and path.suffix.lower() in {".jpg", ".jpeg"}:
                 reads.append(path.name)
             return original_read_bytes(path)
 
         with patch.object(Path, "read_bytes", recording_read_bytes):
-            build_preflight(root, config(), ResultStore.for_root(root))
+            build_preflight(root, config(), ResultStore.for_root(root), template_name="notice")
 
         self.assertEqual(
             reads,
@@ -620,9 +613,9 @@ class PreflightTests(unittest.TestCase):
 
     def test_preflight_keeps_approved_bytes_internal_and_hashes_that_copy(self):
         root = root_with_inputs()
-        approved = (root / "mms_img" / "mms_01_intro.jpg").read_bytes()
+        approved = (root / "input" / "notice" / "mms_01_intro.jpg").read_bytes()
 
-        report = build_preflight(root, config(), ResultStore.for_root(root))
+        report = build_preflight(root, config(), ResultStore.for_root(root), template_name="notice")
 
         self.assertEqual(report.approved_images[0].data, approved)
         self.assertEqual(
@@ -638,7 +631,7 @@ class PreflightTests(unittest.TestCase):
         root = root_with_inputs()
         store = seed_current(root, (result_row(FIRST),))
 
-        report = build_preflight(root, config(), store)
+        report = build_preflight(root, config(), store, template_name="notice")
 
         self.assertEqual(report.mode, "normal")
         self.assertEqual(report.eligible_numbers, ())
@@ -649,7 +642,7 @@ class PreflightTests(unittest.TestCase):
             root, (result_row(FIRST, status="PENDING_CONFIRMATION", attempts=1),)
         )
 
-        public = build_preflight(root, config(), store).to_public_dict()
+        public = build_preflight(root, config(), store, template_name="notice").to_public_dict()
 
         self.assertEqual(public["pending_reconciliation_count"], 1)
         self.assertEqual(public["pending_masked_samples"], ("*******1111",))
@@ -681,7 +674,7 @@ class PreflightTests(unittest.TestCase):
             ),
         )
 
-        report = build_preflight(root, config(), current, resend_failed=True)
+        report = build_preflight(root, config(), current, resend_failed=True, template_name="notice")
 
         self.assertEqual(report.mode, "resend_failed")
         self.assertEqual(report.eligible_numbers, (THIRD, SECOND))
@@ -711,7 +704,7 @@ class PreflightTests(unittest.TestCase):
         )
 
         public = build_preflight(
-            root, config(), current, resend_failed=True
+            root, config(), current, resend_failed=True, template_name="notice"
         ).to_public_dict()
         rendered = json.dumps(public, ensure_ascii=False)
 
@@ -734,12 +727,12 @@ class PreflightTests(unittest.TestCase):
             (result_row(SECOND, request_id="request-2", message_id="message-2"),),
         )
         first = build_preflight(
-            root, config(), current, resend_failed=True
+            root, config(), current, resend_failed=True, template_name="notice"
         ).approval_token
 
         latest.write_bytes(latest.read_bytes() + b"\r\n")
         second = build_preflight(
-            root, config(), current, resend_failed=True
+            root, config(), current, resend_failed=True, template_name="notice"
         ).approval_token
 
         self.assertNotEqual(first, second)
@@ -769,7 +762,7 @@ class PreflightTests(unittest.TestCase):
                 ResultFormatError,
                 "^resend snapshot changed during preflight$",
             ):
-                build_preflight(root, config(), current, resend_failed=True)
+                build_preflight(root, config(), current, resend_failed=True, template_name="notice")
 
     def test_resend_token_binds_candidate_order_with_source_hash_held_constant(self):
         root = root_with_inputs((SECOND, THIRD))
@@ -796,7 +789,7 @@ class PreflightTests(unittest.TestCase):
             return original_read_bytes(path)
 
         with patch.object(Path, "read_bytes", read_with_fixed_snapshot_identity):
-            first = build_preflight(root, config(), current, resend_failed=True)
+            first = build_preflight(root, config(), current, resend_failed=True, template_name="notice")
             write_snapshot(
                 root,
                 latest.name,
@@ -805,7 +798,7 @@ class PreflightTests(unittest.TestCase):
                     result_row(SECOND, request_id="request-2", message_id="message-2"),
                 ),
             )
-            second = build_preflight(root, config(), current, resend_failed=True)
+            second = build_preflight(root, config(), current, resend_failed=True, template_name="notice")
 
         self.assertEqual(first.resend_source, second.resend_source)
         self.assertEqual(first.resend_source_sha256, second.resend_source_sha256)
@@ -835,7 +828,7 @@ class PreflightTests(unittest.TestCase):
             return original_read_bytes(path)
 
         with patch.object(Path, "read_bytes", read_with_fixed_snapshot_identity):
-            first = build_preflight(root, config(), current, resend_failed=True)
+            first = build_preflight(root, config(), current, resend_failed=True, template_name="notice")
             write_snapshot(
                 root,
                 latest.name,
@@ -844,7 +837,7 @@ class PreflightTests(unittest.TestCase):
                     result_row(THIRD, request_id="request-3", message_id="message-3"),
                 ),
             )
-            second = build_preflight(root, config(), current, resend_failed=True)
+            second = build_preflight(root, config(), current, resend_failed=True, template_name="notice")
 
         self.assertEqual(first.resend_source, second.resend_source)
         self.assertEqual(first.resend_source_sha256, second.resend_source_sha256)
@@ -863,11 +856,11 @@ class PreflightTests(unittest.TestCase):
             "result_20260814_100000.csv",
             (result_row(SECOND, request_id="request-2", message_id="message-2"),),
         )
-        first = build_preflight(root, config(), current, resend_failed=True)
+        first = build_preflight(root, config(), current, resend_failed=True, template_name="notice")
         latest = root / "results" / "result_20260814_110000.csv"
         latest.write_bytes(older.read_bytes())
 
-        second = build_preflight(root, config(), current, resend_failed=True)
+        second = build_preflight(root, config(), current, resend_failed=True, template_name="notice")
 
         self.assertEqual(first.resend_source_sha256, second.resend_source_sha256)
         self.assertEqual(first.eligible_numbers, second.eligible_numbers)
@@ -889,7 +882,7 @@ class PreflightTests(unittest.TestCase):
         latest.write_bytes(b"corrupt")
 
         with self.assertRaises(ResultFormatError):
-            build_preflight(root, config(), current, resend_failed=True)
+            build_preflight(root, config(), current, resend_failed=True, template_name="notice")
 
     def test_missing_snapshot_blocks_resend_preflight(self):
         root = root_with_inputs((SECOND,))
@@ -899,7 +892,7 @@ class PreflightTests(unittest.TestCase):
         )
 
         with self.assertRaises(ResultFormatError):
-            build_preflight(root, config(), current, resend_failed=True)
+            build_preflight(root, config(), current, resend_failed=True, template_name="notice")
 
     def test_resend_preflight_never_includes_validation_failure_rows(self):
         root = root_with_inputs((SECOND, "not-a-number"))
@@ -922,7 +915,7 @@ class PreflightTests(unittest.TestCase):
             ),
         )
 
-        report = build_preflight(root, config(), current, resend_failed=True)
+        report = build_preflight(root, config(), current, resend_failed=True, template_name="notice")
 
         self.assertEqual(report.total, 2)
         self.assertEqual(report.eligible_numbers, (SECOND,))
@@ -940,7 +933,7 @@ class PreflightTests(unittest.TestCase):
             (result_row(SECOND, request_id="request-2", message_id="message-2"),),
         )
 
-        report = build_preflight(root, config(), current, resend_failed=True)
+        report = build_preflight(root, config(), current, resend_failed=True, template_name="notice")
 
         self.assertEqual(report.eligible_numbers, ())
 
@@ -957,7 +950,7 @@ class PreflightTests(unittest.TestCase):
             ResultFormatError,
             "^resend snapshot does not match current checkpoint$",
         ):
-            build_preflight(root, config(), current, resend_failed=True)
+            build_preflight(root, config(), current, resend_failed=True, template_name="notice")
 
     def test_resend_snapshot_must_match_current_checkpoint_status_and_api_ids(self):
         cases = (
@@ -985,7 +978,7 @@ class PreflightTests(unittest.TestCase):
                     ResultFormatError,
                     "^resend snapshot does not match current checkpoint$",
                 ):
-                    build_preflight(root, config(), current, resend_failed=True)
+                    build_preflight(root, config(), current, resend_failed=True, template_name="notice")
 
     def test_resend_snapshot_must_match_candidate_delivery_id_attempts_and_error(self):
         changes = (
@@ -1019,13 +1012,13 @@ class PreflightTests(unittest.TestCase):
                     ResultFormatError,
                     "^resend snapshot does not match current checkpoint$",
                 ):
-                    build_preflight(root, config(), current, resend_failed=True)
+                    build_preflight(root, config(), current, resend_failed=True, template_name="notice")
 
     def test_approval_token_binds_every_valid_result_row_field(self):
         """Catches an approval token that omits a checkpoint identity field."""
         root = root_with_inputs((FIRST, SECOND))
         original = seed_current(root, (result_row(FIRST),))
-        first_token = build_preflight(root, config(), original).approval_token
+        first_token = build_preflight(root, config(), original, template_name="notice").approval_token
         valid_mutations = (
             result_row(SECOND),
             result_row(FIRST, delivery_id="3456789ABCDEFGHJ"),
@@ -1043,7 +1036,7 @@ class PreflightTests(unittest.TestCase):
         for changed_row in valid_mutations:
             with self.subTest(changed_row=changed_row):
                 changed = seed_current(root, (changed_row,))
-                changed_token = build_preflight(root, config(), changed).approval_token
+                changed_token = build_preflight(root, config(), changed, template_name="notice").approval_token
 
                 self.assertNotEqual(first_token, changed_token)
 

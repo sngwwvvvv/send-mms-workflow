@@ -12,8 +12,6 @@ from urllib.error import HTTPError
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
-from .inputs import MESSAGE_BODY, MESSAGE_CONTENT, MESSAGE_SUBJECT
-
 
 @dataclass(frozen=True)
 class ApiResponse:
@@ -321,8 +319,8 @@ class SensClient:
         file_ids: Sequence[str],
         *,
         content_type: str,
-        content: str = MESSAGE_CONTENT,
-        subject: str | None = MESSAGE_SUBJECT,
+        content: str,
+        subject: str | None = None,
     ) -> SendResponse:
         return self.send_one(
             to,
@@ -337,7 +335,7 @@ class SensClient:
         to: str,
         *,
         content_type: str,
-        content: str = MESSAGE_BODY,
+        content: str,
         subject: str | None = None,
     ) -> SendResponse:
         if type(content_type) is not str or content_type not in {"COMM", "AD"}:
@@ -360,8 +358,8 @@ class SensClient:
         file_ids: Sequence[str],
         *,
         content_type: str,
-        content: str = MESSAGE_CONTENT,
-        subject: str | None = MESSAGE_SUBJECT,
+        content: str,
+        subject: str | None = None,
     ) -> SendResponse:
         if type(content_type) is not str or content_type not in {"COMM", "AD"}:
             raise ExplicitApiFailure("INVALID_REQUEST", "content type is invalid")
