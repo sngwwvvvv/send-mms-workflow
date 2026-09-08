@@ -638,7 +638,7 @@ class CliTests(unittest.TestCase):
         events = [json.loads(line) for line in logs[0].read_text(encoding="utf-8").splitlines()]
         self.assertTrue(events)
         self.assertEqual(public["approved_at"], "2026-08-13T10:00:00.000+09:00")
-        self.assertEqual(snapshots[0].name, "result_20260813_100000.csv")
+        self.assertEqual(snapshots[0].name, "result_20260813_100010.csv")
         self.assertTrue(all(event["logged_at"].endswith("+09:00") for event in events))
         serialized_events = json.dumps(events, ensure_ascii=False)
         for forbidden in (
@@ -716,12 +716,14 @@ class CliTests(unittest.TestCase):
         self.assertEqual(
             public["settings"],
             {
-                "worker_count": 5,
-                "poll_interval_seconds": 1,
+                "worker_count": 2,
+                "poll_interval_seconds": 5,
                 "confirmation_timeout_seconds": 120,
                 "retry_delay_seconds": 10,
                 "max_attempts": 3,
                 "rate_limit_delays_seconds": [10, 20],
+                "api_min_interval_seconds": 0.5,
+                "max_in_flight": 8,
             },
         )
         rendered = json.dumps(public, ensure_ascii=False)
@@ -1081,8 +1083,8 @@ class CliTests(unittest.TestCase):
             [],
         )
 
-    def test_seven_recipients_use_fixed_five_worker_contract_and_one_post_each(self):
-        """Catches any executor bound other than five while using real workers."""
+    def test_seven_recipients_use_fixed_two_worker_contract_and_one_post_each(self):
+        """Catches any executor bound other than two while using real workers."""
         numbers = tuple(f"0100000000{index}" for index in range(1, 8))
         root = make_root(numbers)
         token = approval_token(root)
@@ -1131,8 +1133,8 @@ class CliTests(unittest.TestCase):
             with patch("sens_mms.workflow.ThreadPoolExecutor", recording_executor):
                 cli_thread.start()
                 constructed = executor_constructed.wait(timeout=5)
-                if constructed and observed_max_workers == [5]:
-                    five_entered = transport.wait_for_message_entries(5)
+                if constructed and observed_max_workers == [2]:
+                    five_entered = transport.wait_for_message_entries(2)
                     entered_count = len(transport.entered_message_recipients)
                     finished_while_blocked = finished.is_set()
         except BaseException as exc:
@@ -1145,9 +1147,9 @@ class CliTests(unittest.TestCase):
         if probe_error is not None:
             raise probe_error
         self.assertTrue(constructed, "real executor construction was not observed")
-        self.assertEqual(observed_max_workers, [5])
-        self.assertTrue(five_entered, "five message POSTs did not reach the closed gate")
-        self.assertEqual(entered_count, 5)
+        self.assertEqual(observed_max_workers, [2])
+        self.assertTrue(five_entered, "two message POSTs did not reach the closed gate")
+        self.assertEqual(entered_count, 2)
         self.assertFalse(finished_while_blocked)
         code, public, _ = outcome["result"]
 
@@ -1677,7 +1679,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(observed_now[0].isoformat(), "2026-08-13T10:00:00+09:00")
         snapshots = list((root / "results").glob("result_*.csv"))
         logs = list((root / "logs").glob("delivery_*.jsonl"))
-        self.assertEqual([path.name for path in snapshots], ["result_20260813_100000.csv"])
+        self.assertEqual([path.name for path in snapshots], ["result_20260813_100010.csv"])
         log_rows = [
             json.loads(line)
             for line in logs[0].read_text(encoding="utf-8").splitlines()

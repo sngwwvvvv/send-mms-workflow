@@ -169,14 +169,38 @@ class CoordinationTests(unittest.TestCase):
         self.assertEqual(
             RUN_SETTINGS,
             RunSettings(
-                worker_count=5,
-                poll_interval_seconds=1,
+                worker_count=2,
+                poll_interval_seconds=5,
                 confirmation_timeout_seconds=120,
                 retry_delay_seconds=10,
                 max_attempts=3,
                 rate_limit_delays_seconds=(10, 20),
+                api_min_interval_seconds=0.5,
+                max_in_flight=8,
             ),
         )
+
+    def test_before_api_call_paces_consecutive_calls_at_min_interval(self):
+        clock = LockedManualClock()
+        coordinator = self.make_coordinator(clock=clock)
+
+        coordinator.before_api_call()
+        coordinator.before_api_call()
+        coordinator.before_api_call()
+
+        self.assertEqual(clock.sleeps, [0.5, 0.5])
+        self.assertEqual(clock.monotonic(), 1.0)
+
+    def test_pace_and_429_wait_use_the_later_deadline_not_the_sum(self):
+        clock = LockedManualClock()
+        coordinator = self.make_coordinator(clock=clock)
+
+        coordinator.before_api_call()
+        coordinator.record_429()
+        coordinator.before_api_call()
+
+        self.assertEqual(clock.sleeps, [10])
+        self.assertEqual(clock.monotonic(), 10)
 
     def test_batch_commit_is_all_or_nothing_against_fresh_rows(self):
         coordinator = self.make_coordinator()
@@ -300,7 +324,11 @@ class CoordinationTests(unittest.TestCase):
 
         self.assertEqual(errors, [])
         self.assertEqual(len(passed), 5)
-        self.assertEqual(clock.sleeps, [10])
+        self.assertEqual(clock.sleeps[0], 10)
+        self.assertEqual(
+            clock.sleeps[1:],
+            [RUN_SETTINGS.api_min_interval_seconds] * 4,
+        )
 
     def test_overlapping_second_429_extends_from_observation_without_locking_sleeper(self):
         """Catches a sleeping waiter delaying publication and turning max into addition."""

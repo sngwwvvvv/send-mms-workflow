@@ -22,9 +22,11 @@ class RunSettings:
     retry_delay_seconds: float
     max_attempts: int
     rate_limit_delays_seconds: tuple[float, float]
+    api_min_interval_seconds: float
+    max_in_flight: int
 
 
-RUN_SETTINGS = RunSettings(5, 1, 120, 10, 3, (10, 20))
+RUN_SETTINGS = RunSettings(2, 5, 120, 10, 3, (10, 20), 0.5, 8)
 
 
 class RunSafetyError(RuntimeError):
@@ -45,6 +47,7 @@ class RunCoordinator:
         self._stopped = threading.Event()
         self._blocked_until = 0.0
         self._rate_limit_count = 0
+        self._next_api_at = 0.0
 
     def stop(self) -> None:
         self._stopped.set()
@@ -110,12 +113,19 @@ class RunCoordinator:
     def before_api_call(self) -> None:
         while True:
             self.raise_if_stopped()
+            sleep_for = 0.0
             with self._rate_lock:
                 self.raise_if_stopped()
-                remaining = self._blocked_until - self.clock.monotonic()
-            if remaining <= 0:
+                now = self.clock.monotonic()
+                ready_at = max(self._blocked_until, self._next_api_at)
+                if ready_at <= now:
+                    self._next_api_at = now + RUN_SETTINGS.api_min_interval_seconds
+                    sleep_for = 0.0
+                else:
+                    sleep_for = ready_at - now
+            if sleep_for <= 0:
                 break
-            self.clock.sleep(remaining)
+            self.clock.sleep(sleep_for)
         self.raise_if_stopped()
 
     def wait_until(self, deadline: float) -> None:

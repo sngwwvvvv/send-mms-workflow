@@ -10,12 +10,14 @@ This policy defines the active integrated MMS contract.
 - Fixed run settings are:
 
 ```text
-worker_count=5
-poll_interval_seconds=1
+worker_count=2
+poll_interval_seconds=5
 confirmation_timeout_seconds=120
 retry_delay_seconds=10
 max_attempts=3
 rate_limit_delays_seconds=[10,20]
+api_min_interval_seconds=0.5
+max_in_flight=8
 ```
 
 - `SENT` means correlated `COMPLETED + success`; `FAILED` means the current approved run reached three explicit failures; `PENDING_CONFIRMATION` means the result is not yet final.
@@ -162,7 +164,7 @@ PENDING_CONFIRMATION은 실패가 아니다. `PENDING_CONFIRMATION`인 동안 `i
 
 ## 폴링과 재시도 상태 머신
 
-1. 접수된 요청은 동일한 `requestId`와 `messageId`를 사용해 1초마다 결과 조회 API로 확인한다.
+1. 접수된 요청은 동일한 `requestId`와 `messageId`를 사용해 5초마다 결과 조회 API로 확인한다. POST 직후 첫 조회도 이 간격을 기다린 뒤에 시작한다. 목록 조회 레코드가 이미 `COMPLETED`이면 결과 GET을 생략한다.
 2. `messages[].status="READY"` 또는 `PROCESSING`이면 실패로 판단하지 않고 같은 요청을 계속 조회한다.
 3. `messages[].status="COMPLETED"`이고 `messages[].statusName="success"`이면 `SENT`, `is_sent=true`, `error=null`로 확정한다.
 4. `COMPLETED`이고 `statusName="fail"`이면 명시적 실패로 처리한다. `statusCode`는 승인된 내부 상수 또는 ASCII 숫자 1~4자리만 보존하고 그 외에는 `UNKNOWN`으로 저장하며, 비어 있지 않은 `statusMessage`는 `redacted`로 저장한다.
@@ -171,7 +173,7 @@ PENDING_CONFIRMATION은 실패가 아니다. `PENDING_CONFIRMATION`인 동안 `i
 7. 사용자가 승인한 한 번의 발송 실행에서 최초 발송을 포함해 수신번호당 최대 3회까지만 POST한다.
 8. 세 번째 명시적 실패 후 `FAILED`, `is_sent=false`로 확정하고 정제된 최종 상태 코드와 고정된 비식별 오류 문구를 `error`에 기록한다.
 9. 한 발송 요청이 120초 동안 종결되지 않으면 `PENDING_CONFIRMATION`으로 저장하고 해당 번호의 처리를 보류한다.
-10. 첫 HTTP 429는 실행 전체의 새 API 호출을 10초, 같은 실행의 두 번째 이후 429는 매번 20초 멈춘다. GET 429는 transient lookup이고, 메시지 POST가 명확한 HTTP 429 응답을 받은 경우만 비접수 명시적 실패로 센다.
+10. 모든 upload/send/list/get 호출은 실행 전체에서 최소 0.5초 간격을 두고, 동시에 미확인 POST는 최대 8건이다. 첫 HTTP 429는 실행 전체의 새 API 호출을 10초, 같은 실행의 두 번째 이후 429는 매번 20초 멈춘다. GET 429는 transient lookup이고, 메시지 POST가 명확한 HTTP 429 응답을 받은 경우만 비접수 명시적 실패로 센다. 429 대기와 최소 호출 간격은 합산하지 않고 더 늦은 시각만 적용한다.
 
 ## 모호한 요청 결과
 

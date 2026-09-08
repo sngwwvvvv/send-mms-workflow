@@ -328,7 +328,7 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(result.row.delivery_status, "SENT")
         self.assertEqual([call[0] for call in api.calls], ["send", "list", "get", "get"])
         self.assertEqual(api.calls[0][2:], (("file-1", "file-2"), "COMM"))
-        self.assertEqual(clock.sleeps, [1])
+        self.assertEqual(clock.sleeps, [5, 5, 5])
         self.assertEqual(
             state_boundaries(log.events),
             [
@@ -339,6 +339,45 @@ class PipelineTests(unittest.TestCase):
             ],
         )
         self.assertEqual(self.persisted(), result.row)
+
+    def test_list_completed_success_skips_get(self):
+        """Catches a terminal list record still issuing a redundant result GET."""
+        api = ScriptedPipelineApi(
+            sends=(send_response(),),
+            lists=(list_response(message("COMPLETED", "success")),),
+        )
+        pipeline, clock, _, _ = self.make_pipeline(api, reservation())
+        result = pipeline.run(reservation(), work(), ("file-1", "file-2"))
+
+        self.assertEqual(result.row.delivery_status, "SENT")
+        self.assertEqual([call[0] for call in api.calls], ["send", "list"])
+        self.assertEqual(clock.sleeps, [5])
+
+    def test_list_completed_fail_skips_get_and_retries_post(self):
+        """Catches a terminal list failure ignoring COMPLETED+fail until GET."""
+        api = ScriptedPipelineApi(
+            sends=(
+                send_response(),
+                send_response("request-2"),
+            ),
+            lists=(
+                list_response(message("COMPLETED", "fail", status_code="3001")),
+                list_response(
+                    message(
+                        "COMPLETED",
+                        "success",
+                        request_id="request-2",
+                        message_id="message-2",
+                    )
+                ),
+            ),
+        )
+        pipeline, clock, _, _ = self.make_pipeline(api, reservation())
+        result = pipeline.run(reservation(), work(), ("file-1", "file-2"))
+
+        self.assertEqual(result.row.delivery_status, "SENT")
+        self.assertEqual([call[0] for call in api.calls], ["send", "list", "send", "list"])
+        self.assertEqual(clock.sleeps, [5, 10, 5])
 
     def test_single_send_logs_masked_number_and_progress(self):
         api = ScriptedPipelineApi(
@@ -393,7 +432,7 @@ class PipelineTests(unittest.TestCase):
 
         self.assertEqual(result.row.delivery_status, "SENT")
         self.assertEqual(api.send_times, [10])
-        self.assertEqual(clock.sleeps, [10])
+        self.assertEqual(clock.sleeps, [10, 5, 5])
 
     def test_send_attempt_started_event_failure_preserves_attempt_and_starts_no_post(self):
         """Catches a failed SEND_ATTEMPT_STARTED write being swallowed before POST."""
@@ -566,8 +605,8 @@ class PipelineTests(unittest.TestCase):
         result = pipeline.run(reservation(), work(), ("file-1", "file-2"))
 
         self.assertEqual(result.row.delivery_status, "SENT")
-        self.assertEqual([call[0] for call in api.calls], ["send", "send", "list", "get"])
-        self.assertEqual(clock.sleeps, [10])
+        self.assertEqual([call[0] for call in api.calls], ["send", "send", "list"])
+        self.assertEqual(clock.sleeps, [10, 5])
         self.assertEqual(result.row.attempts, 2)
 
     def test_three_explicit_post_failures_checkpoint_failed_with_only_sanitized_error(self):
@@ -633,7 +672,7 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(result.row.delivery_status, "PENDING_CONFIRMATION")
         self.assertEqual([call[0] for call in api.calls], ["send", "time_list"])
         self.assertEqual(api.calls[1][-2:], (NUMBER, "MMS"))
-        self.assertEqual(clock.sleeps, [])
+        self.assertEqual(clock.sleeps, [0.5])
         serialized = repr(log.events)
         self.assertNotIn("response lost", serialized)
 
@@ -718,7 +757,7 @@ class PipelineTests(unittest.TestCase):
         )
 
         self.assertEqual(result.row.delivery_status, "SENT")
-        self.assertEqual(clock.sleeps, [10])
+        self.assertEqual(clock.sleeps, [10, 5, 5])
         self.assertEqual([call[0] for call in api.calls], ["send", "list", "get"])
 
     def test_retry_action_waits_only_to_carried_absolute_deadline(self):
@@ -763,8 +802,8 @@ class PipelineTests(unittest.TestCase):
         result = pipeline.run(row, approved, ("file-1", "file-2"))
 
         self.assertEqual(result.row.delivery_status, "SENT")
-        self.assertEqual(clock.sleeps, [3])
-        self.assertEqual(clock.monotonic(), 10)
+        self.assertEqual(clock.sleeps, [3, 5, 5])
+        self.assertEqual(clock.monotonic(), 20)
 
     def test_invalid_action_state_combinations_never_post_or_change_the_row(self):
         """Catches terminal or ineligible rows being rewritten and posted."""
@@ -966,7 +1005,7 @@ class PipelineTests(unittest.TestCase):
 
         self.assertEqual(result.row.delivery_status, "SENT")
         self.assertEqual([call[0] for call in api.calls], ["send", "list", "list", "get"])
-        self.assertEqual(clock.sleeps, [1])
+        self.assertEqual(clock.sleeps, [5, 5, 5])
 
     def test_get_requires_exact_stored_request_message_and_recipient(self):
         """Catches a terminal result for another correlation being adopted."""
@@ -1002,7 +1041,7 @@ class PipelineTests(unittest.TestCase):
 
         self.assertEqual(result.row.delivery_status, "SENT")
         self.assertEqual(result.row.attempts, 1)
-        self.assertEqual(clock.sleeps, [1, 1])
+        self.assertEqual(clock.sleeps, [5, 5, 5, 5])
         errors = [fields for event, fields in log.events if event == "API_LOOKUP_ERROR"]
         self.assertEqual(len(errors), 2)
         self.assertNotIn("private-list", repr(log.events))
@@ -1021,7 +1060,7 @@ class PipelineTests(unittest.TestCase):
         result = pipeline.run(row, work("RECONCILE", True))
 
         self.assertEqual(result.row.delivery_status, "SENT")
-        self.assertEqual(clock.sleeps, [1, 9])
+        self.assertEqual(clock.sleeps, [5, 5])
         self.assertNotIn("private-429", repr(log.events))
 
     def test_every_repeated_ready_and_processing_get_is_logged(self):
@@ -1039,7 +1078,7 @@ class PipelineTests(unittest.TestCase):
         result = pipeline.run(row, work("RECONCILE", True))
 
         self.assertEqual(result.row.delivery_status, "SENT")
-        self.assertEqual(clock.sleeps, [1, 1, 1])
+        self.assertEqual(clock.sleeps, [5, 5, 5])
         self.assertEqual(
             sum(event == "DELIVERY_POLL_RESPONSE" for event, _ in log.events), 4
         )
@@ -1076,7 +1115,7 @@ class PipelineTests(unittest.TestCase):
         result = pipeline.run(reservation(), work(), ("file-1", "file-2"))
 
         self.assertEqual(result.row.delivery_status, "PENDING_CONFIRMATION")
-        self.assertEqual([call[0] for call in api.calls].count("get"), 115)
+        self.assertEqual([call[0] for call in api.calls].count("get"), 21)
         self.assertEqual(clock.monotonic(), 120)
 
     def test_retry_and_rate_deadlines_merge_at_later_deadline_not_sum(self):
@@ -1093,7 +1132,7 @@ class PipelineTests(unittest.TestCase):
         result = pipeline.run(reservation(), work(), ("file-1", "file-2"))
 
         self.assertEqual(result.row.delivery_status, "SENT")
-        self.assertEqual(clock.sleeps, [10])
+        self.assertEqual(clock.sleeps, [10, 5])
         self.assertEqual([call[0] for call in api.calls][:2], ["send", "send"])
 
     def test_invalid_work_action_is_rejected_before_api(self):

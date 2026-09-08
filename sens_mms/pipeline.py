@@ -46,6 +46,8 @@ class PipelineResult:
     needs_post: bool = False
     retry_not_before: float | None = None
     stage_success: bool = False
+    confirmation_deadline: float | None = None
+    keep_polling: bool = False
 
 
 import sys
@@ -698,101 +700,126 @@ class RecipientPipeline:
             elif type(retry_not_before) not in {int, float}:
                 raise ResultFormatError("approved retry deadline invalid")
         while current.attempts < RUN_SETTINGS.max_attempts:
-            if retry_not_before is not None:
-                self._wait_for_retry(retry_not_before)
-            self.coordinator.before_api_call()
-            attempt_row = replace(
+            posted = self.post_attempt(
                 current,
-                delivery_status="PENDING_CONFIRMATION",
-                is_sent="",
-                attempts=current.attempts + 1,
-                request_id="",
-                message_id="",
-                error=None,
+                work,
+                file_ids,
+                retry_not_before=retry_not_before,
             )
-            current = self._checkpoint(current, attempt_row)
-            self.coordinator.write(
-                "SEND_ATTEMPT_STARTED",
-                delivery_id=current.delivery_id,
-                attempt=current.attempts,
+            retry_not_before = None
+            if posted.confirmation_deadline is None:
+                if posted.needs_post:
+                    current = posted.row
+                    retry_not_before = posted.retry_not_before
+                    continue
+                return posted
+            outcome = self._confirm_until(
+                posted.row,
+                work,
+                posted.confirmation_deadline,
+                delay_first=True,
             )
-            _log_single_line(
-                current.receiving_number,
-                "전송 요청",
-                f"{current.attempts}/3",
-            )
-            self.coordinator.before_api_call()
-            started_at = self._seoul_time(self.coordinator.clock.now())
-            attempt_started = self.coordinator.clock.monotonic()
-            try:
-                response = self.api.send_one(
-                    current.receiving_number,
-                    file_ids,
-                    content_type=self.content_type,
-                    content=MESSAGE_CONTENT,
-                    subject=MESSAGE_SUBJECT,
-                )
-            except ExplicitApiFailure as failure:
-                if failure.http_status == 429:
-                    self.coordinator.record_429()
-                outcome = self._explicit_failure_single(
-                    current,
-                    work,
-                    failure.status,
-                    failure.message,
-                )
-                self.coordinator.write(
-                    "SEND_RESPONSE",
-                    delivery_id=outcome.row.delivery_id,
-                    attempt=outcome.row.attempts,
-                    api="send",
-                    http_status=failure.http_status,
-                    response=failure.response or None,
-                    error=safe_error_dict(failure.status, failure.message),
-                )
-                if not outcome.needs_post:
-                    return outcome
-                self._log_retry_single(outcome.row)
-                current = outcome.row
-                retry_not_before = outcome.retry_not_before
-                continue
-            except AmbiguousPostOutcome:
-                deadline = attempt_started + RUN_SETTINGS.confirmation_timeout_seconds
-                self._log_ambiguous_single(current)
-                return self._recover_ambiguous_single(current, work, started_at, deadline)
-
-            if not self._is_exact_acceptance(response):
-                deadline = attempt_started + RUN_SETTINGS.confirmation_timeout_seconds
-                self._log_ambiguous_single(current)
-                return self._recover_ambiguous_single(current, work, started_at, deadline)
-
-            deadline = (
-                self.coordinator.clock.monotonic()
-                + RUN_SETTINGS.confirmation_timeout_seconds
-            )
-            accepted = replace(current, request_id=response.request_id)
-            current = self._checkpoint(current, accepted)
-            self.coordinator.write(
-                "SEND_RESPONSE",
-                delivery_id=current.delivery_id,
-                attempt=current.attempts,
-                api="send",
-                http_status=response.http_status,
-                request_id=current.request_id,
-                response=send_to_log_dict(response),
-            )
-            _log_single_line(
-                current.receiving_number,
-                "접수 확인",
-                response.status_code,
-            )
-            outcome = self._resolve_request_single(current, work, deadline)
             if not outcome.needs_post:
                 return outcome
             self._log_retry_single(outcome.row)
             current = outcome.row
             retry_not_before = outcome.retry_not_before
         return PipelineResult(current)
+
+    def post_attempt(
+        self,
+        row: ResultRow,
+        work: ApprovedWork,
+        file_ids: tuple[str, ...],
+        *,
+        retry_not_before: float | None = None,
+    ) -> PipelineResult:
+        current = row
+        if retry_not_before is not None:
+            self._wait_for_retry(retry_not_before)
+        attempt_row = replace(
+            current,
+            delivery_status="PENDING_CONFIRMATION",
+            is_sent="",
+            attempts=current.attempts + 1,
+            request_id="",
+            message_id="",
+            error=None,
+        )
+        current = self._checkpoint(current, attempt_row)
+        self.coordinator.write(
+            "SEND_ATTEMPT_STARTED",
+            delivery_id=current.delivery_id,
+            attempt=current.attempts,
+        )
+        _log_single_line(
+            current.receiving_number,
+            "전송 요청",
+            f"{current.attempts}/3",
+        )
+        self.coordinator.before_api_call()
+        started_at = self._seoul_time(self.coordinator.clock.now())
+        attempt_started = self.coordinator.clock.monotonic()
+        try:
+            response = self.api.send_one(
+                current.receiving_number,
+                file_ids,
+                content_type=self.content_type,
+                content=MESSAGE_CONTENT,
+                subject=MESSAGE_SUBJECT,
+            )
+        except ExplicitApiFailure as failure:
+            if failure.http_status == 429:
+                self.coordinator.record_429()
+            outcome = self._explicit_failure_single(
+                current,
+                work,
+                failure.status,
+                failure.message,
+            )
+            self.coordinator.write(
+                "SEND_RESPONSE",
+                delivery_id=outcome.row.delivery_id,
+                attempt=outcome.row.attempts,
+                api="send",
+                http_status=failure.http_status,
+                response=failure.response or None,
+                error=safe_error_dict(failure.status, failure.message),
+            )
+            if outcome.needs_post:
+                self._log_retry_single(outcome.row)
+            return outcome
+        except AmbiguousPostOutcome:
+            deadline = attempt_started + RUN_SETTINGS.confirmation_timeout_seconds
+            self._log_ambiguous_single(current)
+            return self._recover_ambiguous_single(current, work, started_at, deadline)
+
+        if not self._is_exact_acceptance(response):
+            deadline = attempt_started + RUN_SETTINGS.confirmation_timeout_seconds
+            self._log_ambiguous_single(current)
+            return self._recover_ambiguous_single(current, work, started_at, deadline)
+
+        deadline = (
+            self.coordinator.clock.monotonic()
+            + RUN_SETTINGS.confirmation_timeout_seconds
+        )
+        accepted = replace(current, request_id=response.request_id)
+        current = self._checkpoint(current, accepted)
+        self.coordinator.write(
+            "SEND_RESPONSE",
+            delivery_id=current.delivery_id,
+            attempt=current.attempts,
+            api="send",
+            http_status=response.http_status,
+            request_id=current.request_id,
+            response=send_to_log_dict(response),
+        )
+        _log_single_line(
+            current.receiving_number,
+            "접수 확인",
+            response.status_code,
+        )
+        return PipelineResult(current, confirmation_deadline=deadline)
 
     def _reconcile_single(self, row: ResultRow, work: ApprovedWork) -> PipelineResult:
         if not self._nonempty_exact_string(row.request_id):
@@ -802,10 +829,10 @@ class RecipientPipeline:
             + RUN_SETTINGS.confirmation_timeout_seconds
         )
         if self._nonempty_exact_string(row.message_id):
-            return self._poll_message_single(row, work, deadline)
+            return self._confirm_until(row, work, deadline, delay_first=False)
         if type(row.message_id) is not str or row.message_id:
             return PipelineResult(row)
-        return self._resolve_request_single(row, work, deadline)
+        return self._confirm_until(row, work, deadline, delay_first=False)
 
     def _recover_ambiguous_single(
         self,
@@ -845,116 +872,151 @@ class RecipientPipeline:
         self._log_list_response_single(current, response)
         if len(matches) != 1:
             return PipelineResult(current)
-        return self._poll_message_single(current, work, deadline)
+        classified = self._classify_record(current, work, matches[0])
+        if classified is not None:
+            return classified
+        return self._confirm_until(current, work, deadline, delay_first=True)
 
-    def _resolve_request_single(
+    def _confirm_until(
         self,
         row: ResultRow,
         work: ApprovedWork,
         deadline: float,
+        *,
+        delay_first: bool,
     ) -> PipelineResult:
         current = row
-        while not self._nonempty_exact_string(current.message_id):
-            if not self._before_lookup(deadline):
-                return PipelineResult(current)
-            _log_single_line(current.receiving_number, "접수 확인", "조회 중")
-            try:
-                response = self.api.list_by_request(current.request_id)
-            except TransientLookupError as failure:
-                self._record_lookup_failure_single(current, "list", failure)
+        first = True
+        while True:
+            if delay_first or not first:
                 if not self._sleep_for_poll(deadline):
                     return PipelineResult(current)
-                continue
-
-            matches = [
-                record
-                for record in response.messages
-                if self._request_match_single(record, current)
-            ]
-            previous = current
-            if len(matches) == 1:
-                current = replace(current, message_id=matches[0].message_id)
-                current = self._checkpoint(previous, current)
-            self._log_list_response_single(current, response)
-            if current.message_id:
-                return self._poll_message_single(current, work, deadline)
-            if not self._sleep_for_poll(deadline):
-                return PipelineResult(current)
-        return self._poll_message_single(current, work, deadline)
-
-    def _poll_message_single(
-        self,
-        row: ResultRow,
-        work: ApprovedWork,
-        deadline: float,
-    ) -> PipelineResult:
-        current = row
-        while self.coordinator.clock.monotonic() < deadline:
-            if not self._before_lookup(deadline):
-                return PipelineResult(current)
-            _log_single_line(current.receiving_number, "최종 확인", "조회 중")
-            try:
-                response = self.api.get_message(current.message_id)
-            except TransientLookupError as failure:
-                self._record_lookup_failure_single(current, "get", failure)
-                if not self._sleep_for_poll(deadline):
-                    return PipelineResult(current)
-                continue
-
-            message = response.message
-            correlated = self._get_match(message, current)
-            outcome = None
+            first = False
+            outcome = self.confirm_once(current, work, deadline)
             if (
-                correlated
-                and type(message.status) is str
-                and message.status == "COMPLETED"
-                and type(message.status_name) is str
-                and message.status_name == "success"
+                outcome.needs_post
+                or outcome.row.delivery_status in {"SENT", "FAILED"}
+                or outcome.row.delivery_status != "PENDING_CONFIRMATION"
+                or not outcome.keep_polling
             ):
-                outcome = self._sent_single(current)
-            elif (
-                correlated
-                and type(message.status) is str
-                and message.status == "COMPLETED"
-                and type(message.status_name) is str
-                and message.status_name == "fail"
-            ):
-                outcome = self._explicit_failure_single(
-                    current,
-                    work,
-                    message.status_code,
-                    message.status_message,
-                )
-            elif not (
-                correlated
-                and type(message.status) is str
-                and message.status in {"READY", "PROCESSING"}
-            ):
-                outcome = PipelineResult(current)
-
-            event_row = outcome.row if outcome is not None else current
-            self.coordinator.write(
-                "DELIVERY_POLL_RESPONSE",
-                delivery_id=event_row.delivery_id,
-                attempt=event_row.attempts,
-                api="get",
-                http_status=response.http_status,
-                request_id=current.request_id,
-                message_id=current.message_id,
-                response=message_result_to_log_dict(response),
-            )
-            if correlated and type(message.status) is str:
-                if message.status in {"READY", "PROCESSING"}:
-                    _log_single_line(
-                        current.receiving_number,
-                        "최종 확인",
-                        message.status,
-                    )
-            if outcome is not None:
                 return outcome
-            if not self._sleep_for_poll(deadline):
-                break
-        return PipelineResult(current)
+            current = outcome.row
+
+    def confirm_once(
+        self,
+        row: ResultRow,
+        work: ApprovedWork,
+        deadline: float,
+    ) -> PipelineResult:
+        if not self._before_lookup(deadline):
+            return PipelineResult(row)
+        if not self._nonempty_exact_string(row.message_id):
+            return self._list_once(row, work, deadline)
+        return self._get_once(row, work, deadline)
+
+    def _list_once(
+        self,
+        row: ResultRow,
+        work: ApprovedWork,
+        deadline: float,
+    ) -> PipelineResult:
+        _log_single_line(row.receiving_number, "접수 확인", "조회 중")
+        try:
+            response = self.api.list_by_request(row.request_id)
+        except TransientLookupError as failure:
+            self._record_lookup_failure_single(row, "list", failure)
+            return PipelineResult(row, keep_polling=True)
+
+        matches = [
+            record
+            for record in response.messages
+            if self._request_match_single(record, row)
+        ]
+        current = row
+        if len(matches) == 1:
+            current = replace(row, message_id=matches[0].message_id)
+            current = self._checkpoint(row, current)
+        self._log_list_response_single(current, response)
+        if len(matches) != 1:
+            return PipelineResult(current, keep_polling=True)
+        classified = self._classify_record(current, work, matches[0])
+        if classified is not None:
+            return classified
+        return PipelineResult(current, keep_polling=True)
+
+    def _get_once(
+        self,
+        row: ResultRow,
+        work: ApprovedWork,
+        deadline: float,
+    ) -> PipelineResult:
+        _log_single_line(row.receiving_number, "최종 확인", "조회 중")
+        try:
+            response = self.api.get_message(row.message_id)
+        except TransientLookupError as failure:
+            self._record_lookup_failure_single(row, "get", failure)
+            return PipelineResult(row, keep_polling=True)
+
+        message = response.message
+        correlated = self._get_match(message, row)
+        outcome = self._classify_record(row, work, message)
+        event_row = outcome.row if outcome is not None else row
+        self.coordinator.write(
+            "DELIVERY_POLL_RESPONSE",
+            delivery_id=event_row.delivery_id,
+            attempt=event_row.attempts,
+            api="get",
+            http_status=response.http_status,
+            request_id=row.request_id,
+            message_id=row.message_id,
+            response=message_result_to_log_dict(response),
+        )
+        if correlated and type(message.status) is str:
+            if message.status in {"READY", "PROCESSING"}:
+                _log_single_line(
+                    row.receiving_number,
+                    "최종 확인",
+                    message.status,
+                )
+        if outcome is not None:
+            return outcome
+        return PipelineResult(row, keep_polling=True)
+
+    def _classify_record(
+        self,
+        row: ResultRow,
+        work: ApprovedWork,
+        record: MessageRecord,
+    ) -> PipelineResult | None:
+        correlated = self._get_match(record, row)
+        if (
+            correlated
+            and type(record.status) is str
+            and record.status == "COMPLETED"
+            and type(record.status_name) is str
+            and record.status_name == "success"
+        ):
+            return self._sent_single(row)
+        if (
+            correlated
+            and type(record.status) is str
+            and record.status == "COMPLETED"
+            and type(record.status_name) is str
+            and record.status_name == "fail"
+        ):
+            return self._explicit_failure_single(
+                row,
+                work,
+                record.status_code,
+                record.status_message,
+            )
+        if (
+            correlated
+            and type(record.status) is str
+            and record.status in {"READY", "PROCESSING"}
+        ):
+            return None
+        return PipelineResult(row)
 
     def _sent_single(self, row: ResultRow) -> PipelineResult:
         sent = replace(

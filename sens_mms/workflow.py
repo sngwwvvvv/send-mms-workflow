@@ -4,7 +4,9 @@ from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
+from queue import Empty, Queue
 from typing import Protocol, Sequence
+import threading
 from zoneinfo import ZoneInfo
 
 from .api import ExplicitApiFailure
@@ -54,6 +56,15 @@ class ApprovalTokenMismatch(ValueError):
 class _ApprovedSend:
     work: ApprovedWork
     reconciled_row: ResultRow | None = None
+
+
+@dataclass(frozen=True)
+class _QueuedJob:
+    kind: str
+    row: ResultRow
+    work: ApprovedWork
+    deadline: float | None = None
+    not_before: float | None = None
 
 
 class Workflow:
@@ -168,7 +179,7 @@ class Workflow:
         if send_items:
             file_ids = self._upload_approved_images(report)
             phase_two_jobs = self._publish_reservations(report, tuple(send_items))
-            self._run_phase(phase_two_jobs, file_ids)
+            self._run_send_confirm_jobs(phase_two_jobs, file_ids)
             self.coordinator.raise_if_stopped()
 
         self.coordinator.read_rows()
@@ -200,6 +211,199 @@ class Workflow:
             result_snapshot=snapshot,
             event_log=Path(self.event_log.path),
         )
+
+    def _run_send_confirm_jobs(
+        self,
+        items: Sequence[tuple[ResultRow, ApprovedWork]],
+        file_ids: Sequence[str] = (),
+    ) -> None:
+        jobs = tuple(items)
+        if not jobs:
+            return
+        pipeline = self._pipeline
+        if pipeline is None:
+            raise ResultFormatError("recipient pipeline is unavailable")
+        self.coordinator.raise_if_stopped()
+        send_q: Queue[_QueuedJob] = Queue()
+        confirm_q: Queue[_QueuedJob] = Queue()
+        for row, work in jobs:
+            send_q.put(_QueuedJob("SEND", row, work))
+        errors: list[BaseException] = []
+        in_flight = 0
+        in_flight_lock = threading.Condition()
+        outstanding = len(jobs)
+        outstanding_lock = threading.Lock()
+
+        def release_in_flight() -> None:
+            nonlocal in_flight
+            with in_flight_lock:
+                if in_flight > 0:
+                    in_flight -= 1
+                in_flight_lock.notify_all()
+
+        def try_acquire_in_flight() -> bool:
+            nonlocal in_flight
+            with in_flight_lock:
+                if in_flight >= RUN_SETTINGS.max_in_flight:
+                    return False
+                in_flight += 1
+                return True
+
+        def finish_recipient() -> None:
+            nonlocal outstanding
+            with outstanding_lock:
+                outstanding -= 1
+
+        def retry_send(result: PipelineResult, work: ApprovedWork) -> None:
+            retry_work = ApprovedWork(
+                receiving_number=work.receiving_number,
+                action="RETRY_EXPLICIT",
+                allow_retry_after_explicit_failure=True,
+                source_delivery_id=result.row.delivery_id,
+                retry_not_before=result.retry_not_before,
+            )
+            send_q.put(
+                _QueuedJob(
+                    "SEND",
+                    result.row,
+                    retry_work,
+                    not_before=result.retry_not_before,
+                )
+            )
+
+        def execute(job: _QueuedJob) -> None:
+            if job.not_before is not None:
+                self.coordinator.wait_until(job.not_before)
+            self.coordinator.raise_if_stopped()
+            if job.kind == "SEND":
+                if not try_acquire_in_flight():
+                    send_q.put(job)
+                    return
+                released = False
+                try:
+                    retry_not_before = (
+                        job.work.retry_not_before
+                        if job.work.action == "RETRY_EXPLICIT"
+                        else None
+                    )
+                    result = pipeline.post_attempt(
+                        job.row,
+                        job.work,
+                        tuple(file_ids),
+                        retry_not_before=retry_not_before,
+                    )
+                    if result.confirmation_deadline is not None:
+                        confirm_q.put(
+                            _QueuedJob(
+                                "CONFIRM",
+                                result.row,
+                                job.work,
+                                deadline=result.confirmation_deadline,
+                                not_before=(
+                                    self.clock.monotonic()
+                                    + RUN_SETTINGS.poll_interval_seconds
+                                ),
+                            )
+                        )
+                    else:
+                        release_in_flight()
+                        released = True
+                        if result.needs_post:
+                            retry_send(result, job.work)
+                        else:
+                            finish_recipient()
+                except BaseException:
+                    if not released:
+                        release_in_flight()
+                    raise
+                return
+            if job.deadline is None:
+                raise ResultFormatError("confirmation deadline missing")
+            result = pipeline.confirm_once(job.row, job.work, job.deadline)
+            now = self.clock.monotonic()
+            still_open = (
+                job.deadline is not None
+                and now < job.deadline
+                and result.keep_polling
+            )
+            if still_open:
+                confirm_q.put(
+                    _QueuedJob(
+                        "CONFIRM",
+                        result.row,
+                        job.work,
+                        deadline=job.deadline,
+                        not_before=now + RUN_SETTINGS.poll_interval_seconds,
+                    )
+                )
+                return
+            release_in_flight()
+            if result.needs_post:
+                self.coordinator.write(
+                    "RETRY_SCHEDULED",
+                    delivery_id=result.row.delivery_id,
+                    attempt=result.row.attempts + 1,
+                )
+                retry_send(result, job.work)
+            else:
+                finish_recipient()
+
+        def consume() -> None:
+            try:
+                while True:
+                    self.coordinator.raise_if_stopped()
+                    with outstanding_lock:
+                        done = outstanding <= 0
+                    if done and send_q.empty() and confirm_q.empty():
+                        return
+                    job = None
+                    try:
+                        job = confirm_q.get_nowait()
+                    except Empty:
+                        pass
+                    if job is None:
+                        try:
+                            job = send_q.get(timeout=0.05)
+                        except Empty:
+                            continue
+                    execute(job)
+            except RunSafetyError:
+                return
+            except BaseException as exc:
+                errors.append(exc)
+                self.coordinator.stop()
+            finally:
+                self._mark_worker_joined()
+
+        with ThreadPoolExecutor(max_workers=RUN_SETTINGS.worker_count) as pool:
+            futures = [pool.submit(consume) for _ in range(RUN_SETTINGS.worker_count)]
+            try:
+                for future in as_completed(futures):
+                    try:
+                        future.result()
+                    except BaseException as exc:
+                        self._stop_and_cancel(futures)
+                        errors.append(exc)
+            except BaseException:
+                self._stop_and_cancel(futures)
+                raise
+        if errors:
+            primary = next(
+                (
+                    error
+                    for error in errors
+                    if not isinstance(error, (RunSafetyError, CancelledError))
+                ),
+                next(
+                    (
+                        error
+                        for error in errors
+                        if not isinstance(error, CancelledError)
+                    ),
+                    errors[0],
+                ),
+            )
+            raise primary
 
     def _run_phase(
         self,
@@ -271,6 +475,9 @@ class Workflow:
                 "approved result does not match current checkpoint"
             )
         self.store.rows = dict(archived_rows)
+
+    def _mark_worker_joined(self) -> None:
+        return
 
     def _run_one(
         self,

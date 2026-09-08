@@ -122,6 +122,8 @@ class PreflightReport:
                 "rate_limit_delays_seconds": list(
                     RUN_SETTINGS.rate_limit_delays_seconds
                 ),
+                "api_min_interval_seconds": RUN_SETTINGS.api_min_interval_seconds,
+                "max_in_flight": RUN_SETTINGS.max_in_flight,
             },
             "approval_token": self.approval_token,
         }

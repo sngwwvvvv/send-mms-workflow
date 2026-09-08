@@ -395,12 +395,14 @@ class PreflightTests(unittest.TestCase):
         self.assertEqual(
             public["settings"],
             {
-                "worker_count": 5,
-                "poll_interval_seconds": 1,
+                "worker_count": 2,
+                "poll_interval_seconds": 5,
                 "confirmation_timeout_seconds": 120,
                 "retry_delay_seconds": 10,
                 "max_attempts": 3,
                 "rate_limit_delays_seconds": [10, 20],
+                "api_min_interval_seconds": 0.5,
+                "max_in_flight": 8,
             },
         )
         self.assertEqual(public["pending_reconciliation_count"], 1)
@@ -528,6 +530,8 @@ class PreflightTests(unittest.TestCase):
             {"max_attempts": 4},
             {"rate_limit_delays_seconds": (11, 20)},
             {"rate_limit_delays_seconds": (10, 21)},
+            {"api_min_interval_seconds": 1.0},
+            {"max_in_flight": 9},
         )
         for mutation in mutations:
             with self.subTest(mutation=mutation):
