@@ -1,6 +1,6 @@
 # SENS 통합 MMS 워커 운영 안내
 
-이 프로젝트는 승인된 본문과 이미지 두 장을 수신번호별 단건 MMS 요청으로 처리한다. 구현 완료, 테스트 통과, main 브랜치 병합, `preflight` 실행은 모두 실발송 승인이 아니다. `live` 실행마다 직전에 생성된 승인 토큰과 발신번호 등록 확인에 대해 별도의 명시적 승인을 받아야 한다.
+이 프로젝트는 `input` 폴더에서 선택한 템플릿의 본문과 이미지 1~2장을 수신번호별 단건 MMS 요청으로 처리한다. 구현 완료, 테스트 통과, main 브랜치 병합, `preflight` 실행은 모두 실발송 승인이 아니다. `live` 실행마다 직전에 생성된 승인 토큰과 발신번호 등록 확인에 대해 별도의 명시적 승인을 받아야 한다.
 
 ## 실행 환경 준비
 
@@ -12,15 +12,57 @@ uv sync --locked
 
 `.env`는 uv 의존성 파일이 아니므로 커밋하지 않는다. `uv sync`와 `--help` 확인은 실발송 승인이 아니며 SENS API를 호출하지 않는다.
 
+## 템플릿 준비와 선택
+
+`input` 바로 아래 폴더 하나가 템플릿 하나다. 폴더에 UTF-8 `message.txt`와 JPG/JPEG 이미지 1~2장을 준비한다. 기존 `mms_img`나 소스 코드의 고정 문구를 자동으로 사용하지 않는다. 실제 템플릿 파일은 Git에서 제외된다.
+
+```text
+input/
+  개업안내/
+    message.txt
+    01_intro.jpg
+    02_details.jpg
+  행사안내/
+    message.txt
+    01_poster.jpg
+```
+
+본문은 제목 줄을 포함한 파일 전체를 공백·줄바꿈 그대로 보낸다. 별도 API subject는 넣지 않는다. UTF-8 BOM이 있으면 파일 표식으로만 제거한다. 공백뿐인 본문, 지원하지 않는 문자, EUC-KR 기준 2000바이트 초과 본문은 차단하며 자동으로 자르거나 대체하지 않는다. SENS의 본문 인코딩은 EUC-KR 기준이다. [공식 메시지 발송 명세](https://api.ncloud-docs.com/docs/sens-sms-send)
+
+이미지는 파일명 순서로 첨부하므로 `01_`, `02_` 접두어를 권장한다. 각 이미지가 300KB 이하, 최대 1500×1440이어야 한다. 현재 프로젝트가 지원하는 첨부 수는 1~2장이다. [공식 첨부 업로드 명세](https://api.ncloud-docs.com/docs/sens-sms-attachment-create)
+
+터미널에서 `uv run sens-mms preflight`를 실행하면 이름순 목록과 이미지 수가 나타나며 번호로 선택한다.
+
+```text
+사용할 템플릿을 선택하세요.
+
+  1. 개업안내 — 이미지 2장
+  2. 행사안내 — 이미지 1장
+
+선택: 2
+```
+
+메뉴·입력 안내는 stderr, 검증 결과 JSON은 stdout에 출력한다. 목록에서 선택한 뒤 본문·첨부 순서·검증 결과·대상·승인 토큰을 확인한다. 템플릿이 하나여도 자동 선택하지 않는다. 비대화형 실행에서는 이름을 직접 지정한다.
+
+```powershell
+uv run sens-mms preflight --template 행사안내
+```
+
+없는 템플릿, 잘못된 파일 형식이나 제한 초과는 사전 차단한다. 폴더와 파일은 `input` 안에 있어야 하며 외부를 가리키는 링크·정션은 허용하지 않는다. 템플릿이 없으면 먼저 위 구조로 파일을 준비한다.
+
 ## 일반 발송
 
 ```powershell
 uv run sens-mms preflight
 $approvalToken = Read-Host 'Paste the approval_token printed by this exact preflight'
-uv run sens-mms live --approval-token $approvalToken --confirm-sender-registered
+uv run sens-mms live --template 행사안내 --approval-token $approvalToken --confirm-sender-registered
 ```
 
-`preflight`는 네트워크 요청과 이벤트 로그 생성을 하지 않는다. 출력에서 총 대상 건수, 마스킹된 번호 표본, 등록된 발신번호, 정확한 본문, 이미지 검증 결과, `type=MMS`, `subject=null`, `contentType=COMM`, 아래 고정 설정을 확인한다. 입력, 이미지, 기존 결과 상태, 재발송 스냅샷 또는 승인 대상이 바뀌면 이전 토큰은 사용할 수 없다.
+위 `행사안내`는 preflight에서 실제 선택한 이름으로 바꾼다. `live`는 `--template`이 필수이며 목록을 다시 묻지 않는다.
+
+`preflight`는 네트워크 요청과 이벤트 로그 생성을 하지 않는다. 출력에서 선택한 템플릿명, 총 대상 건수, 마스킹된 번호 표본, 등록된 발신번호, 정확한 본문, 이미지 검증 결과, `type=MMS`, `subject=null`, `contentType=COMM`, 아래 고정 설정을 확인한다. 선택한 템플릿, 본문, 이미지 이름·순서·바이트, 기존 결과 상태, 재발송 스냅샷 또는 승인 대상이 바뀌면 이전 토큰은 사용할 수 없다. 최종 검증에 사용한 본문·이미지 바이트로만 실제 요청을 만들며 검증 뒤 파일을 다시 열지 않는다.
+
+현재 `COMM`만 지원한다. 템플릿을 바꿀 때마다 광고성 여부를 확인해야 하며, 광고 발송 지원이 추가된 것은 아니다.
 
 고정 실행 설정은 다음과 같으며 CLI로 변경할 수 없다.
 
@@ -39,8 +81,8 @@ uv run sens-mms live --approval-token $approvalToken --confirm-sender-registered
 2. 기존 `PENDING_CONFIRMATION`은 현재 수신번호 CSV에 남아 있는지와 관계없이 신규 발송보다 먼저 모두 처리하고 해당 워커가 종료될 때까지 기다린다.
 3. `attempts>0`이고 상관 식별자가 있는 행은 저장된 식별자로 조회한다. 현재 CSV에 있는 승인 대상에서 명시적 실패가 확인되고 승인 실행의 시도 횟수가 남은 경우에만 재POST 대상이 된다. CSV에 없는 행은 조회로만 조정하며 자동 재POST하지 않는다. 양수 시도 횟수인데 식별자가 비어 있는 모호한 행은 보류하며 API를 호출하지 않는다.
 4. 예외적으로 현재 CSV에 있는 `attempts=0`, 비어 있지 않은 `delivery_id`, 빈 요청/메시지 식별자를 가진 사전 POST 예약은 같은 `delivery_id`로 이어서 최초 POST한다. CSV에 없는 동일 상태 예약은 보류한다. 새 식별자를 부여하거나 중복 발송하지 않는다.
-5. pending-first 단계 뒤 실제 POST 대상이 하나라도 남아 있을 때만 승인된 이미지 바이트를 업로드한다. `mms_01_intro.jpg`, `mms_02_details.jpg` 순서로 실행당 한 번씩 업로드하고, 두 `fileId`를 같은 순서로 모든 단건 요청에 재사용한다. pending-only 실행에는 업로드가 없다.
-6. 각 수신번호는 독립된 MMS POST 하나를 사용한다. `messages`에는 수신번호 한 건만 있고, 승인된 UTF-8 본문과 `contentType=COMM`을 그대로 사용하며 `subject`를 넣지 않는다. 동시에 실행되는 수신번호 워커는 최대 5개다.
+5. pending-first 단계 뒤 실제 POST 대상이 하나라도 남아 있을 때만 승인된 이미지 바이트를 업로드한다. 선택한 템플릿의 파일명 순서로 실행당 한 번씩 업로드하고, `fileId`를 같은 순서로 모든 단건 요청에 재사용한다. pending-only 실행에는 업로드가 없다. 실제 업로드 파일명은 이미지 내용 해시에서 파생한다. SENS가 같은 이름·크기의 파일을 재사용하므로 다른 템플릿 이미지가 섞이지 않도록 하기 위한 처리다.
+6. 각 수신번호는 독립된 MMS POST 하나를 사용한다. `messages`에는 수신번호 한 건만 있고, 승인된 `message.txt` 전체와 `contentType=COMM`을 그대로 사용하며 `subject`를 넣지 않는다. 동시에 실행되는 수신번호 워커는 최대 5개다.
 
 첨부 업로드가 실패하면 업로드를 재시도하지 않고 메시지 POST도 시작하지 않는다. 업로드 429도 동일하다. 모든 API 호출은 한 실행에서 공유되는 전역 429 게이트를 통과하며, 첫 429 뒤 10초, 이후 각 429 뒤 20초 동안 새 API 호출을 막는다. 명시적 전송 실패에 대한 10초 재시도 대기는 이 전역 게이트와 중복해서 더하지 않는다.
 
@@ -51,16 +93,18 @@ uv run sens-mms live --approval-token $approvalToken --confirm-sender-registered
 ```powershell
 uv run sens-mms preflight --resend-failed
 $resendApprovalToken = Read-Host 'Paste the approval_token printed by this exact resend preflight'
-uv run sens-mms live --resend-failed --approval-token $resendApprovalToken --confirm-sender-registered
+uv run sens-mms live --resend-failed --approval-token $resendApprovalToken --confirm-sender-registered --template 행사안내
 ```
 
 ## 기존 실행 스크립트 호환
 
-기존 자동화도 같은 uv 환경에서 `uv run python sens_mms_cli.py preflight`처럼 계속 실행할 수 있다. 다만 운영 문서와 예시는 설치된 `sens-mms` 진입점을 기본 경로로 사용한다.
+기존 자동화도 같은 uv 환경에서 `uv run python sens_mms_cli.py preflight`처럼 계속 실행할 수 있다. 다만 운영 문서와 예시는 설치된 `sens-mms` 진입점을 기본 경로로 사용한다. 비대화형 스크립트에는 `--template 행사안내`처럼 이름을 추가해야 한다. 기존 토큰을 재사용하지 말고 선택한 템플릿으로 preflight를 다시 실행한다.
 
 재발송 사전 검증은 `results` 폴더에서 파일명 기준으로 가장 최신인 완료 스냅샷 하나를 선택한다. 선택된 스냅샷이 손상됐거나 현재 `result.csv`의 대상 행과 정확히 일치하지 않으면 이전 스냅샷으로 되돌아가지 않고 차단한다. 승인 토큰을 실행 잠금 안에서 다시 검증한 직후, 검증 실패 기록·첨부 업로드·예약·메시지 API보다 먼저 현재 `result.csv` 전체의 불변 재발송 전 보관본을 만든다. 보관본 또는 비식별 `RESEND_ARCHIVE_WRITTEN` 이벤트 기록에 실패하면 어떤 결과 변경이나 API 호출도 시작하지 않는다. 승인된 `FAILED` 후보만 새 `delivery_id`와 `attempts=0`으로 시작한다. 기존 `SENT`, `PENDING_CONFIRMATION`, 입력 검증 실패, 승인 대상이 아닌 행은 초기화하지 않는다. 현재 CSV에 있는 기존 attempts-zero 예약은 재발송 모드에서도 같은 ID로 먼저 이어서 처리한다.
 
 ## 결과와 로그
+
+**모든 템플릿은 기존 발송 이력을 공유한다.** 템플릿을 바꿔도 기존 `SENT` 번호는 제외되며, 미확정 요청을 새 내용으로 다시 보내지 않는다. 별도 캠페인이나 템플릿별 결과 초기화 기능은 없다. 기존 요청의 명시적 실패가 확인되고 현재 preflight에서 재시도를 승인한 경우에만 선택한 템플릿으로 재POST할 수 있다.
 
 - `results/result.csv`: 현재 상태 체크포인트. 상태 전이마다 원자적으로 갱신한다.
 - `results/result_YYYYMMDD_HHMMSS.csv`: 정상 완료 시점의 불변 스냅샷과 재발송 실행 직전의 불변 보관본. 재발송 실행에서는 두 파일이 서로 별도로 만들어지며, 같은 초 충돌 시 `_001`부터 접미사를 사용하고 기존 파일을 덮어쓰지 않는다. 이벤트 로그의 비식별 `RESEND_ARCHIVE_WRITTEN`은 직전 보관 경계를, `RESULT_SNAPSHOT_WRITTEN`은 정상 완료 스냅샷을 뜻한다.

@@ -5,13 +5,7 @@ import hashlib, json
 from typing import Literal
 
 from .coordination import RUN_SETTINGS
-from .inputs import (
-    MESSAGE_BODY,
-    MESSAGE_CONTENT,
-    MESSAGE_SUBJECT,
-    load_recipients,
-    validate_images,
-)
+from .inputs import load_recipients, load_template
 from .results import (
     ResultFormatError,
     ResultRow,
@@ -49,11 +43,13 @@ class PreflightReport:
     masked_samples: tuple
     sender: str
     body: str
-    subject: str
+    subject: str | None
+    template_name: str
     content: str
     content_type: str
     images: tuple
     approved_images: tuple = field(repr=False)
+    approved_message_bytes: bytes = field(repr=False)
     approval_token: str
     mode: str
     resend_source: str | None
@@ -107,6 +103,7 @@ class PreflightReport:
                 for work in work_groups["HOLD_AMBIGUOUS"][:3]
             ),
             "sender": self.sender,
+            "template_name": self.template_name,
             "body": self.body,
             "subject": self.subject,
             "content": self.content,
@@ -200,10 +197,11 @@ def classify_absent_pending(row: ResultRow) -> ApprovedWork:
     )
 
 
-def build_preflight(root, config, result_store, *, resend_failed=False):
+def build_preflight(root, config, result_store, *, template_name, resend_failed=False):
     project_root = Path(root)
+    template = load_template(project_root, template_name)
     recipients = load_recipients(project_root / "receiving_numbers.csv")
-    images = validate_images(project_root / "mms_img")
+    images = template.images
     existing = result_store.load()
     valid_numbers = set(recipients.valid_numbers)
     source_path = None
@@ -294,9 +292,11 @@ def build_preflight(root, config, result_store, *, resend_failed=False):
     work_items = tuple(work_items)
     canonical = {
         "sender": config.from_number,
-        "body": MESSAGE_BODY,
-        "subject": MESSAGE_SUBJECT,
-        "content": MESSAGE_CONTENT,
+        "templateName": template.name,
+        "messageBase64": base64.b64encode(template.message_bytes).decode("ascii"),
+        "body": template.content,
+        "subject": None,
+        "content": template.content,
         "type": "MMS",
         "contentType": APPROVED_CONTENT_TYPE,
         "images": [
@@ -347,12 +347,14 @@ def build_preflight(root, config, result_store, *, resend_failed=False):
         work_items=work_items,
         masked_samples=tuple(mask_number(n) for n in eligible[:3]),
         sender=config.from_number,
-        body=MESSAGE_BODY,
-        subject=MESSAGE_SUBJECT,
-        content=MESSAGE_CONTENT,
+        template_name=template.name,
+        body=template.content,
+        subject=None,
+        content=template.content,
         content_type=APPROVED_CONTENT_TYPE,
         images=image_data,
         approved_images=images,
+        approved_message_bytes=template.message_bytes,
         approval_token=token,
         mode="resend_failed" if resend_failed else "normal",
         resend_source=source_path.name if source_path else None,

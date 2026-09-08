@@ -1,4 +1,4 @@
-﻿import base64
+import base64
 import json
 import socket
 import tempfile
@@ -14,7 +14,7 @@ from sens_mms.api import (
     UrlLibTransport,
     make_signature,
 )
-from sens_mms.inputs import MESSAGE_BODY, MESSAGE_CONTENT, MESSAGE_SUBJECT
+from tests.test_inputs import TEST_BODY
 
 
 class RecordingTransport:
@@ -90,7 +90,7 @@ class ApiTests(unittest.TestCase):
         })])
 
         actual = client(transport).send_one(
-            "01012345678", ("file-1", "file-2"), content_type="COMM"
+            "01012345678", ("file-1", "file-2"), content_type="COMM", content=TEST_BODY
         )
 
         self.assertEqual(actual.http_status, 202)
@@ -107,10 +107,9 @@ class ApiTests(unittest.TestCase):
             "contentType": "COMM",
             "countryCode": "82",
             "from": "0212345678",
-            "content": MESSAGE_CONTENT,
+            "content": TEST_BODY,
             "messages": [{"to": "01012345678"}],
             "files": [{"fileId": "file-1"}, {"fileId": "file-2"}],
-            "subject": MESSAGE_SUBJECT,
         })
         self.assertEqual(headers["x-ncp-apigw-timestamp"], "1700000000000")
 
@@ -123,7 +122,7 @@ class ApiTests(unittest.TestCase):
         })])
 
         client(transport).send_one(
-            "01012345678", ("file-1", "file-2"), content_type="AD"
+            "01012345678", ("file-1", "file-2"), content_type="AD", content=TEST_BODY
         )
 
         payload = json.loads(transport.calls[0][3])
@@ -142,7 +141,7 @@ class ApiTests(unittest.TestCase):
                     client(transport).send_one(
                         "01012345678",
                         ("file-1", "file-2"),
-                        content_type=content_type,
+                        content_type=content_type, content=TEST_BODY,
                     )
 
                 self.assertEqual(raised.exception.status, "INVALID_REQUEST")
@@ -221,7 +220,7 @@ class ApiTests(unittest.TestCase):
 
         with self.assertRaises(AmbiguousPostOutcome):
             client(transport).send_one(
-                "01012345678", ["file-1", "file-2"], content_type="COMM"
+                "01012345678", ["file-1", "file-2"], content_type="COMM", content=TEST_BODY
             )
 
     def test_two_xx_send_non_mapping_json_is_ambiguous_without_raw_marker(self):
@@ -234,7 +233,7 @@ class ApiTests(unittest.TestCase):
                     client(transport).send_one(
                         "01012345678",
                         ["file-1", "file-2"],
-                        content_type="COMM",
+                        content_type="COMM", content=TEST_BODY,
                     )
 
                 self.assertNotIn(marker, repr(raised.exception))
@@ -256,7 +255,7 @@ class ApiTests(unittest.TestCase):
                     client(transport).send_one(
                         "01012345678",
                         ["file-1", "file-2"],
-                        content_type="COMM",
+                        content_type="COMM", content=TEST_BODY,
                     )
 
                 self.assertNotIn(marker, repr(raised.exception))
@@ -275,7 +274,7 @@ class ApiTests(unittest.TestCase):
                     client(transport).send_one(
                         "01012345678",
                         ["file-1", "file-2"],
-                        content_type="COMM",
+                        content_type="COMM", content=TEST_BODY,
                     )
 
                 self.assertEqual(
@@ -300,7 +299,7 @@ class ApiTests(unittest.TestCase):
                     client(transport).send_one(
                         "01012345678",
                         ["file-1", "file-2"],
-                        content_type="COMM",
+                        content_type="COMM", content=TEST_BODY,
                     )
 
                 self.assertNotIn(marker, repr(raised.exception))
@@ -310,7 +309,7 @@ class ApiTests(unittest.TestCase):
 
         with self.assertRaises(ExplicitApiFailure) as raised:
             client(transport).send_one(
-                "01012345678", ["file-1", "file-2"], content_type="COMM"
+                "01012345678", ["file-1", "file-2"], content_type="COMM", content=TEST_BODY
             )
 
         self.assertEqual(raised.exception.status, "400")
@@ -331,7 +330,7 @@ class ApiTests(unittest.TestCase):
 
         with self.assertRaises(ExplicitApiFailure) as raised:
             client(transport).send_one(
-                "01012345678", ["file-1", "file-2"], content_type="COMM"
+                "01012345678", ["file-1", "file-2"], content_type="COMM", content=TEST_BODY
             )
 
         self.assertEqual(raised.exception.status, "400")
@@ -358,7 +357,7 @@ class ApiTests(unittest.TestCase):
                     client(transport).send_one(
                         "01012345678",
                         ["file-1", "file-2"],
-                        content_type="COMM",
+                        content_type="COMM", content=TEST_BODY,
                     )
 
                 failure = raised.exception
@@ -385,7 +384,7 @@ class ApiTests(unittest.TestCase):
 
         with self.assertRaises(ExplicitApiFailure) as raised:
             client(transport).send_one(
-                "01012345678", ["file-1", "file-2"], content_type="COMM"
+                "01012345678", ["file-1", "file-2"], content_type="COMM", content=TEST_BODY
             )
 
         failure = raised.exception
@@ -409,7 +408,7 @@ class ApiTests(unittest.TestCase):
 
         with self.assertRaises(ExplicitApiFailure) as raised:
             client(transport).send_one(
-                "01012345678", ["file-1", "file-2"], content_type="COMM"
+                "01012345678", ["file-1", "file-2"], content_type="COMM", content=TEST_BODY
             )
 
         self.assertNotIn("statusName", raised.exception.response)
@@ -441,7 +440,7 @@ class ApiTests(unittest.TestCase):
                     client(transport).send_one(
                         "01012345678",
                         ["file-1", "file-2"],
-                        content_type="COMM",
+                        content_type="COMM", content=TEST_BODY,
                     )
 
                 failure = raised.exception
@@ -756,13 +755,13 @@ class ApiTests(unittest.TestCase):
             "statusCode": "202",
             "statusName": "success",
         })])
-        actual = client(transport).send_mms("01012345678", ("file-1", "file-2"), content_type="COMM")
+        actual = client(transport).send_mms("01012345678", ("file-1", "file-2"), content_type="COMM", content=TEST_BODY)
         self.assertEqual(actual.request_id, "request-1")
         method, url, headers, body, _ = transport.calls[0]
         payload = json.loads(body)
         self.assertEqual(payload["type"], "MMS")
-        self.assertEqual(payload["content"], MESSAGE_CONTENT)
-        self.assertEqual(payload["subject"], MESSAGE_SUBJECT)
+        self.assertEqual(payload["content"], TEST_BODY)
+        self.assertNotIn("subject", payload)
         self.assertEqual(payload["files"], [{"fileId": "file-1"}, {"fileId": "file-2"}])
 
     def test_send_mms_builds_payload_with_files_and_custom_content(self):
@@ -787,12 +786,12 @@ class ApiTests(unittest.TestCase):
             "statusCode": "202",
             "statusName": "success",
         })])
-        actual = client(transport).send_lms("01012345678", content_type="COMM")
+        actual = client(transport).send_lms("01012345678", content_type="COMM", content=TEST_BODY)
         self.assertEqual(actual.request_id, "request-2")
         method, url, headers, body, _ = transport.calls[0]
         payload = json.loads(body)
         self.assertEqual(payload["type"], "LMS")
-        self.assertEqual(payload["content"], MESSAGE_BODY)
+        self.assertEqual(payload["content"], TEST_BODY)
         self.assertNotIn("files", payload)
 
     def test_send_lms_builds_payload_with_custom_content_and_no_files(self):

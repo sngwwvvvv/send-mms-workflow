@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from dataclasses import replace
 from datetime import datetime
@@ -22,7 +22,7 @@ from sens_mms.coordination import RunCoordinator, RunSafetyError
 from sens_mms.pipeline import PipelineResult, RecipientPipeline
 from sens_mms.preflight import ApprovedWork
 from sens_mms.results import ResultFormatError, ResultRow, ResultStore
-from sens_mms.inputs import MESSAGE_BODY
+from tests.test_inputs import TEST_BODY
 
 
 NUMBER = "01000000001"
@@ -154,7 +154,7 @@ class SharedFailureApi:
     def send_mms(self, to, file_ids, *, content_type, content=None, subject=None):
         return self.send_one(to, file_ids, content_type=content_type)
 
-    def send_lms(self, to, *, content_type, content=MESSAGE_BODY, subject=None):
+    def send_lms(self, to, *, content_type, content=TEST_BODY, subject=None):
         with self._lock:
             self.calls.append((to, self.clock.monotonic()))
         if threading.current_thread().name == "unrelated-worker":
@@ -185,7 +185,7 @@ class ScriptedPipelineApi:
         self.calls.append(("send_mms", to, tuple(file_ids), content_type, content, subject))
         return self._next(self.sends)
 
-    def send_lms(self, to, *, content_type, content=MESSAGE_BODY, subject=None):
+    def send_lms(self, to, *, content_type, content=TEST_BODY, subject=None):
         self.calls.append(("send_lms", to, content_type, content, subject))
         return self._next(self.sends)
 
@@ -220,7 +220,7 @@ class TimestampingPipelineApi(ScriptedPipelineApi):
         self.send_times.append(self.clock.monotonic())
         return super().send_mms(to, file_ids, content_type=content_type, content=content, subject=subject)
 
-    def send_lms(self, to, *, content_type, content=MESSAGE_BODY, subject=None):
+    def send_lms(self, to, *, content_type, content=TEST_BODY, subject=None):
         self.send_times.append(self.clock.monotonic())
         return super().send_lms(to, content_type=content_type, content=content, subject=subject)
 
@@ -307,7 +307,7 @@ class PipelineTests(unittest.TestCase):
         clock = ManualClock()
         log = event_log or RecordingEventLog()
         coordinator = RunCoordinator(store, log, clock)
-        return RecipientPipeline(api, coordinator, content_type="COMM"), clock, log, coordinator
+        return RecipientPipeline(api, coordinator, content_type="COMM", content=TEST_BODY), clock, log, coordinator
 
     def persisted(self):
         return ResultStore(self.path).load()[NUMBER]
@@ -830,7 +830,7 @@ class PipelineTests(unittest.TestCase):
             clock,
         )
         api = SharedFailureApi(clock)
-        pipeline = RecipientPipeline(api, coordinator, content_type="COMM")
+        pipeline = RecipientPipeline(api, coordinator, content_type="COMM", content=TEST_BODY)
         errors = []
 
         def run_retry():

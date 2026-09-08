@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo
 
 from sens_mms.api import ApiResponse, make_signature
 from sens_mms.event_log import EventLogError, create_event_log
-from sens_mms.inputs import MESSAGE_BODY, MESSAGE_CONTENT, MESSAGE_SUBJECT
+from tests.test_inputs import TEST_BODY
 from sens_mms.preflight import build_preflight
 from sens_mms.results import ResultRow, ResultStore
 import sens_mms_cli
@@ -313,7 +313,7 @@ def official_message(
         "contentType": "COMM",
         "type": "MMS",
         "subject": "must be filtered",
-        "content": MESSAGE_BODY,
+        "content": TEST_BODY,
         "countryCode": "82",
         "from": ENV["NCP_SENS_FROM_NUMBER"],
         "to": recipient,
@@ -438,7 +438,7 @@ def run_cli(argv, root, *, transport=None, event_log_factory=create_event_log,
         kwargs["delivery_id_factory"] = (
             delivery_id_factory or FixedIdFactory(NEW_ID_1, NEW_ID_2)
         )
-    code = main(argv, **kwargs)
+    code = main([*argv, "--template", "notice"], **kwargs)
     return code, json.loads(output.getvalue()), output.getvalue()
 
 
@@ -555,8 +555,8 @@ class CliTests(unittest.TestCase):
             observed_roots.append(root)
             raise RuntimeError("stop after default-root capture")
 
-        with patch("sens_mms.cli.load_config", side_effect=reject_config):
-            code = packaged_cli.main(["preflight"], environ={}, stdout=StringIO())
+        with patch("sens_mms.cli._select_template", return_value="notice"), patch("sens_mms.cli.load_config", side_effect=reject_config):
+            code = packaged_cli.main(["preflight", "--template", "notice"], environ={}, stdout=StringIO())
 
         self.assertEqual(code, 2)
         self.assertEqual(observed_roots, [Path(__file__).resolve().parent.parent])
@@ -587,7 +587,7 @@ class CliTests(unittest.TestCase):
             ENV["NCP_SECRET_KEY"],
             ENV["NCP_SENS_SERVICE_ID"],
             signature,
-            MESSAGE_BODY,
+            TEST_BODY,
             FILE_1,
             FILE_2,
             *additional,
@@ -644,7 +644,7 @@ class CliTests(unittest.TestCase):
         for forbidden in (
             RECIPIENT,
             ENV["NCP_SENS_FROM_NUMBER"],
-            MESSAGE_BODY,
+            TEST_BODY,
             FILE_1,
             FILE_2,
             ENV["NCP_ACCESS_KEY_ID"],
@@ -663,11 +663,11 @@ class CliTests(unittest.TestCase):
         ]
         self.assertEqual(len(message_posts), 1)
         payload = json.loads(message_posts[0][3].decode("utf-8"))
-        self.assertEqual(payload["content"].encode("utf-8"), MESSAGE_CONTENT.encode("utf-8"))
+        self.assertEqual(payload["content"].encode("utf-8"), TEST_BODY.encode("utf-8"))
         self.assertEqual(payload["contentType"], "COMM")
         self.assertEqual(payload["messages"], [{"to": RECIPIENT}])
         self.assertEqual(payload["files"], [{"fileId": FILE_1}])
-        self.assertEqual(payload["subject"], MESSAGE_SUBJECT)
+        self.assertNotIn("subject", payload)
 
     def test_preflight_creates_no_event_log_and_never_calls_network(self):
         root = make_root((RECIPIENT, SECOND))
@@ -711,7 +711,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(tracker.calls, [])
         self.assertFalse((root / "logs").exists())
         self.assertEqual(public["sender"], ENV["NCP_SENS_FROM_NUMBER"])
-        self.assertEqual(public["body"].encode("utf-8"), MESSAGE_BODY.encode("utf-8"))
+        self.assertEqual(public["body"].encode("utf-8"), TEST_BODY.encode("utf-8"))
         self.assertEqual(public["contentType"], "COMM")
         self.assertEqual(
             public["settings"],
@@ -839,7 +839,7 @@ class CliTests(unittest.TestCase):
             FORMATTED_RECIPIENT,
             NAME,
             ENV["NCP_SENS_FROM_NUMBER"],
-            MESSAGE_BODY,
+            TEST_BODY,
             NEW_ID_1,
             REQUEST_1,
             MESSAGE_1,
@@ -1498,7 +1498,7 @@ class CliTests(unittest.TestCase):
                 for forbidden in (
                     RECIPIENT,
                     ENV["NCP_SENS_FROM_NUMBER"],
-                    MESSAGE_BODY,
+                    TEST_BODY,
                     ENV["NCP_ACCESS_KEY_ID"],
                     ENV["NCP_SECRET_KEY"],
                     ENV["NCP_SENS_SERVICE_ID"],

@@ -4,6 +4,7 @@ from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
+import hashlib
 from typing import Protocol, Sequence
 from zoneinfo import ZoneInfo
 
@@ -67,6 +68,7 @@ class Workflow:
         event_log,
         delivery_id_factory,
         *,
+        template_name: str,
         resend_failed: bool = False,
     ):
         self.root = Path(root)
@@ -76,6 +78,7 @@ class Workflow:
         self.clock = clock
         self.event_log = event_log
         self.delivery_id_factory = delivery_id_factory
+        self.template_name = template_name
         self.resend_failed = resend_failed
         self.coordinator = RunCoordinator(store, event_log, clock)
         self._pipeline: RecipientPipeline | None = None
@@ -85,6 +88,7 @@ class Workflow:
             self.root,
             self.config,
             self.store,
+            template_name=self.template_name,
             resend_failed=self.resend_failed,
         ).approval_token
 
@@ -109,6 +113,7 @@ class Workflow:
             self.root,
             self.config,
             self.store,
+            template_name=self.template_name,
             resend_failed=self.resend_failed,
         )
         if approval_token != report.approval_token:
@@ -121,6 +126,7 @@ class Workflow:
             self.api,
             self.coordinator,
             report.content_type,
+            content=report.content,
         )
         self._record_validation_failures()
 
@@ -291,13 +297,14 @@ class Workflow:
         self,
         report: PreflightReport,
     ) -> tuple[str, ...]:
-        if len(report.approved_images) != 1:
+        if not 1 <= len(report.approved_images) <= 2:
             raise ResultFormatError("approved image count invalid")
         file_ids = []
         for image in report.approved_images:
             self.coordinator.before_api_call()
             try:
-                file_id = self.api.upload_bytes(image.name, image.data)
+                upload_name = hashlib.sha256(image.data).hexdigest()[:36] + ".jpg"
+                file_id = self.api.upload_bytes(upload_name, image.data)
             except Exception as exc:
                 self._record_upload_failure(exc)
                 raise

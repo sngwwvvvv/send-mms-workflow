@@ -22,7 +22,6 @@ from .event_log import (
 )
 from .preflight import ApprovedWork
 from .results import ResultFormatError, ResultRow
-from .inputs import MESSAGE_BODY, MESSAGE_CONTENT, MESSAGE_SUBJECT
 
 
 SEOUL = ZoneInfo("Asia/Seoul")
@@ -30,14 +29,6 @@ _SEND_ACTIONS = frozenset(
     {"RESUME_RESERVATION", "START_FRESH", "RETRY_EXPLICIT"}
 )
 _WORK_ACTIONS = _SEND_ACTIONS | frozenset({"HOLD_AMBIGUOUS", "RECONCILE"})
-_SPLIT_MMS_CONTENT = "."
-_SPLIT_LMS_CONTENT = (
-    "[개업소연 안내]\n\n"
-    "안녕하세요.\n"
-    "국세청에서의 오랜 경험을 바탕으로 호연회계법인에서 새로운 출발을 하게 된 윤성중 세무사입니다.\n\n"
-    "그동안 보내주신 관심에 감사드리며, 앞으로도 많은 응원과 격려 부탁드립니다.\n\n"
-    "뜻깊은 시작을 기쁜 마음으로 함께해 주시면 감사하겠습니다."
-)
 
 
 @dataclass(frozen=True)
@@ -68,12 +59,15 @@ class RecipientPipeline:
         api: SensClient,
         coordinator: RunCoordinator,
         content_type: str,
+        *,
+        content: str,
     ):
         if type(content_type) is not str or content_type not in {"COMM", "AD"}:
             raise ResultFormatError("approved content type invalid")
         self.api = api
         self.coordinator = coordinator
         self.content_type = content_type
+        self.content = content
 
     def run(
         self,
@@ -223,7 +217,7 @@ class RecipientPipeline:
                     response = self.api.send_lms(
                         current.receiving_number,
                         content_type=self.content_type,
-                        content=content if content is not None else MESSAGE_BODY,
+                        content=content if content is not None else self.content,
                         subject=subject,
                     )
             except ExplicitApiFailure as failure:
@@ -729,8 +723,7 @@ class RecipientPipeline:
                     current.receiving_number,
                     file_ids,
                     content_type=self.content_type,
-                    content=MESSAGE_CONTENT,
-                    subject=MESSAGE_SUBJECT,
+                    content=self.content,
                 )
             except ExplicitApiFailure as failure:
                 if failure.http_status == 429:

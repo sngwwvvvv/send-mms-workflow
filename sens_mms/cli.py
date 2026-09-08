@@ -9,6 +9,7 @@ from zoneinfo import ZoneInfo
 from sens_mms.api import SensClient, UrlLibTransport
 from sens_mms.config import ConfigError, load_config
 from sens_mms.event_log import create_event_log, sanitize_status_code
+from sens_mms.inputs import TemplateError, list_templates, load_template
 from sens_mms.preflight import build_preflight
 from sens_mms.results import (
     ResultStore,
@@ -101,6 +102,34 @@ def _completion_dict(summary, store, approved_at):
     }
 
 
+def _select_template(root, command, name, stdin, stderr):
+    if name is not None:
+        load_template(root, name)
+        return name
+    if command == "live" or not stdin.isatty():
+        raise TemplateError("--template NAME is required for live or noninteractive preflight")
+    templates = list_templates(root)
+    print("사용할 템플릿을 선택하세요.", file=stderr)
+    for number, (name, count) in enumerate(templates, 1):
+        print(f"{number}. {name} — 이미지 {count}장", file=stderr)
+    while True:
+        print("선택 (취소: q): ", end="", file=stderr, flush=True)
+        try:
+            value = stdin.readline()
+        except KeyboardInterrupt:
+            raise TemplateError("템플릿 선택을 취소했습니다.") from None
+        if not value or value.strip().lower() in {"q", "quit", "cancel"}:
+            raise TemplateError("템플릿 선택을 취소했습니다.")
+        value = value.strip()
+        if value.isascii() and value.isdigit() and len(value) <= 9:
+            number = int(value)
+            if 1 <= number <= len(templates):
+                name = templates[number - 1][0]
+                load_template(root, name)
+                return name
+        print("목록에 있는 템플릿 번호를 입력하세요.", file=stderr)
+
+
 def main(
     argv=None,
     *,
@@ -110,6 +139,8 @@ def main(
     clock=None,
     timestamp_ms=None,
     stdout=None,
+    stdin=None,
+    stderr=None,
     event_log_factory=create_event_log,
     delivery_id_factory=new_delivery_id,
 ):
@@ -119,10 +150,16 @@ def main(
     try:
         parser = SafeArgumentParser()
         parser.add_argument("command", choices=["preflight", "live"])
+        parser.add_argument("--template")
         parser.add_argument("--approval-token")
         parser.add_argument("--confirm-sender-registered", action="store_true")
         parser.add_argument("--resend-failed", action="store_true")
         args = parser.parse_args(argv)
+        template_name = _select_template(
+            project_root, args.command, args.template,
+            stdin if stdin is not None else sys.stdin,
+            stderr if stderr is not None else sys.stderr,
+        )
         active_clock = SeoulClock(clock or SystemClock())
         config = load_config(project_root, environ)
         store = migrate_legacy_result(project_root)
@@ -130,6 +167,7 @@ def main(
             project_root,
             config,
             store,
+            template_name=template_name,
             resend_failed=args.resend_failed,
         )
         if args.command == "preflight":
@@ -171,6 +209,7 @@ def main(
                 active_clock,
                 event_log,
                 delivery_id_factory,
+                template_name=template_name,
                 resend_failed=args.resend_failed,
             )
             summary = workflow.run_live(args.approval_token)
@@ -190,6 +229,9 @@ def main(
             file=output,
         )
         return 0
+    except TemplateError as exc:
+        print(json.dumps({"status": "BLOCKED", "message": str(exc)}), file=output)
+        return 2
     except Exception:
         print(
             json.dumps(
